@@ -1,0 +1,6 @@
+/target
+*.db
+.baize/
+baize-e2e-*/
+test-env/
+deploy/

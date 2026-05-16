@@ -1,0 +1,17 @@
+[package]
+name = "baize-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "bz"
+path = "src/main.rs"
+
+[dependencies]
+baize-core = { path = "../baize-core" }
+baize-server = { path = "../baize-server" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
