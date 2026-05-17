@@ -224,88 +224,7 @@ async fn test_blob_write_requires_auth() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-// ─── 3. Commit 操作 ───
-
-#[tokio::test]
-async fn test_commit_create_with_blobs() {
-    let app = test_app();
-    // 写入 blob
-    let req = post_json(
-        "/api/v0/blobs",
-        json!({"content": "commit data"}),
-        Some("baize-root"),
-    );
-    let (_, body) = send(&app, req).await;
-    let blob_hash = body["hash"].as_str().unwrap();
-
-    // 创建 commit
-    let req = post_json(
-        "/api/v0/commits",
-        json!({"blob_hashes": [blob_hash], "message": "initial commit"}),
-        Some("baize-root"),
-    );
-    let (status, body) = send(&app, req).await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["message"], "initial commit");
-    assert_eq!(body["author"], "baize-root");
-    assert!(body["hash"].as_str().unwrap().len() == 64);
-    assert!(body["blob_hashes"].as_array().unwrap().len() == 1);
-}
-
-#[tokio::test]
-async fn test_commit_log() {
-    let app = test_app();
-    // 创建两个 commit 链
-    let req = post_json("/api/v0/blobs", json!({"content": "d1"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let h1 = b["hash"].as_str().unwrap();
-    let req = post_json("/api/v0/commits", json!({"blob_hashes": [h1], "message": "first"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let c1 = b["hash"].as_str().unwrap();
-
-    let req = post_json("/api/v0/blobs", json!({"content": "d2"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let h2 = b["hash"].as_str().unwrap();
-    let req = post_json(
-        "/api/v0/commits",
-        json!({"blob_hashes": [h2], "message": "second", "parent_hash": c1}),
-        Some("baize-root"),
-    );
-    send(&app, req).await;
-
-    // log
-    let req = get_req("/api/v0/log");
-    let (status, body) = send(&app, req).await;
-    assert_eq!(status, StatusCode::OK);
-    let commits = body["commits"].as_array().unwrap();
-    assert_eq!(commits.len(), 2);
-    assert_eq!(commits[0]["message"], "second");
-    assert_eq!(commits[1]["message"], "first");
-}
-
-#[tokio::test]
-async fn test_commit_chain_parent_link() {
-    let app = test_app();
-    let req = post_json("/api/v0/blobs", json!({"content": "d1"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let h1 = b["hash"].as_str().unwrap();
-    let req = post_json("/api/v0/commits", json!({"blob_hashes": [h1], "message": "first"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let c1 = b["hash"].as_str().unwrap();
-
-    let req = post_json("/api/v0/blobs", json!({"content": "d2"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let h2 = b["hash"].as_str().unwrap();
-    let req = post_json(
-        "/api/v0/commits",
-        json!({"blob_hashes": [h2], "message": "second", "parent_hash": c1}),
-        Some("baize-root"),
-    );
-    let (_, body) = send(&app, req).await;
-    assert_eq!(body["parent_hash"], c1);
-}
-
-// ─── 4. Label 操作 ───
+// ─── 3. Label 操作 ───
 
 #[tokio::test]
 async fn test_label_add_and_query() {
@@ -346,86 +265,7 @@ async fn test_label_add_to_nonexistent_entity() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-// ─── 5. Ref 操作 ───
-
-#[tokio::test]
-async fn test_ref_set_get_delete() {
-    let app = test_app();
-    // 创建 commit
-    let req = post_json("/api/v0/blobs", json!({"content": "ref data"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let h = b["hash"].as_str().unwrap();
-    let req = post_json("/api/v0/commits", json!({"blob_hashes": [h], "message": "ref commit"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let c_hash = b["hash"].as_str().unwrap();
-
-    // set ref
-    let req = post_json(
-        "/api/v0/refs",
-        json!({"name": "v1", "commit_hash": c_hash}),
-        Some("baize-root"),
-    );
-    let (status, _) = send(&app, req).await;
-    assert_eq!(status, StatusCode::CREATED);
-
-    // get ref
-    let req = get_req("/api/v0/refs/v1");
-    let (status, body) = send(&app, req).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["commit_hash"], c_hash);
-
-    // delete ref
-    let req = delete_req("/api/v0/refs/v1", "baize-root");
-    let (status, _) = send(&app, req).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-
-    // get should fail
-    let req = get_req("/api/v0/refs/v1");
-    let (status, _) = send(&app, req).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn test_ref_delete_head_fails() {
-    let app = test_app();
-    // 创建 commit（自动设置 HEAD）
-    let req = post_json("/api/v0/blobs", json!({"content": "data"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let h = b["hash"].as_str().unwrap();
-    let req = post_json("/api/v0/commits", json!({"blob_hashes": [h], "message": "head commit"}), Some("baize-root"));
-    send(&app, req).await;
-
-    // 删除 HEAD 应失败
-    let req = delete_req("/api/v0/refs/HEAD", "baize-root");
-    let (status, _) = send(&app, req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn test_ref_list() {
-    let app = test_app();
-    let req = post_json("/api/v0/blobs", json!({"content": "data"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let h = b["hash"].as_str().unwrap();
-    let req = post_json("/api/v0/commits", json!({"blob_hashes": [h], "message": "first"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let c_hash = b["hash"].as_str().unwrap();
-
-    // set extra ref
-    let req = post_json("/api/v0/refs", json!({"name": "stable", "commit_hash": c_hash}), Some("baize-root"));
-    send(&app, req).await;
-
-    // list
-    let req = get_req("/api/v0/refs");
-    let (status, body) = send(&app, req).await;
-    assert_eq!(status, StatusCode::OK);
-    let refs = body["refs"].as_array().unwrap();
-    assert!(refs.len() >= 2);
-    assert!(refs.iter().any(|r| r["name"] == "HEAD"));
-    assert!(refs.iter().any(|r| r["name"] == "stable"));
-}
-
-// ─── 6. Elevation 流程 ───
+// ─── 5. Elevation 流程 ───
 
 #[tokio::test]
 async fn test_elevation_request_approve_list() {
@@ -503,38 +343,6 @@ async fn test_elevation_nonexistent_agent_fails() {
 // ─── 7. Trace 操作 ───
 
 #[tokio::test]
-async fn test_trace_data() {
-    let app = test_app();
-    // 创建 commit 链
-    let req = post_json("/api/v0/blobs", json!({"content": "d1"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let h1 = b["hash"].as_str().unwrap();
-    let req = post_json("/api/v0/commits", json!({"blob_hashes": [h1], "message": "first"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let c1 = b["hash"].as_str().unwrap();
-
-    let req = post_json("/api/v0/blobs", json!({"content": "d2"}), Some("baize-root"));
-    let (_, b) = send(&app, req).await;
-    let h2 = b["hash"].as_str().unwrap();
-    let req = post_json(
-        "/api/v0/commits",
-        json!({"blob_hashes": [h2], "message": "second", "parent_hash": c1}),
-        Some("baize-root"),
-    );
-    let (_, b) = send(&app, req).await;
-    let c2 = b["hash"].as_str().unwrap();
-
-    // trace
-    let req = get_req(&format!("/api/v0/trace/data/{}", c2));
-    let (status, body) = send(&app, req).await;
-    assert_eq!(status, StatusCode::OK);
-    let chain = body["chain"].as_array().unwrap();
-    assert_eq!(chain.len(), 2);
-    assert_eq!(chain[0]["hash"], c2);
-    assert_eq!(chain[1]["hash"], c1);
-}
-
-#[tokio::test]
 async fn test_trace_identity() {
     let app = test_app();
     let req = post_json(
@@ -609,9 +417,7 @@ async fn test_import_size_limit() {
 async fn test_write_endpoints_require_agent_id() {
     let endpoints: Vec<(&str, Value)> = vec![
         ("/api/v0/blobs", json!({"content": "x"})),
-        ("/api/v0/commits", json!({"blob_hashes": ["x"], "message": "x"})),
         ("/api/v0/labels", json!({"entity_hash": "x", "key": "x", "value": "x"})),
-        ("/api/v0/refs", json!({"name": "x", "commit_hash": "x"})),
     ];
 
     for (uri, body) in endpoints {
@@ -669,17 +475,6 @@ async fn test_nonroot_agent_can_write() {
     let (status, body) = send(&app, req).await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(!body["hash"].as_str().unwrap().is_empty());
-
-    // worker 创建 commit → 应成功
-    let hash = body["hash"].as_str().unwrap();
-    let req = post_json(
-        "/api/v0/commits",
-        json!({"blob_hashes": [hash], "message": "worker commit"}),
-        Some("worker"),
-    );
-    let (status, body) = send(&app, req).await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["message"], "worker commit");
 }
 
 #[tokio::test]
@@ -941,4 +736,210 @@ async fn test_audit_filter_by_agent() {
     assert_eq!(status, StatusCode::OK);
     let records = body["records"].as_array().unwrap();
     assert!(records.iter().all(|r| r["agent"] == "worker"));
+}
+
+// ─── 15. 文件操作 ───
+
+#[tokio::test]
+async fn test_file_write_and_read() {
+    let app = test_app();
+
+    // 写入文件
+    let req = post_json(
+        "/api/v0/files/config/app.yaml",
+        json!({"content": "key: value\n"}),
+        Some("baize-root"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["path"], "config/app.yaml");
+    assert!(!body["hash"].as_str().unwrap().is_empty());
+    assert_eq!(body["size"], 11);
+
+    // 读取文件
+    let req = get_req_with_agent("/api/v0/files/config/app.yaml", "baize-root");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["content"], "key: value\n");
+    assert_eq!(body["path"], "config/app.yaml");
+    assert_eq!(body["size"], 11);
+}
+
+#[tokio::test]
+async fn test_file_write_creates_blob() {
+    let app = test_app();
+
+    // 写入文件
+    let req = post_json(
+        "/api/v0/files/notes/log.txt",
+        json!({"content": "hello file", "labels": {"kind": "note"}}),
+        Some("baize-root"),
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 查询 blob — 应有 type=file, action=write 的记录
+    let req = post_json(
+        "/api/v0/blobs/query",
+        json!({"labels": {"type": "file", "path": "notes/log.txt"}}),
+        None,
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let results = body.as_array().unwrap();
+    assert!(!results.is_empty());
+    let blob = &results[0];
+    assert_eq!(blob["labels"]["action"], "write");
+    assert_eq!(blob["labels"]["agent"], "baize-root");
+}
+
+#[tokio::test]
+async fn test_file_delete() {
+    let app = test_app();
+
+    // 写入
+    let req = post_json(
+        "/api/v0/files/temp/cache.tmp",
+        json!({"content": "tmp data"}),
+        Some("baize-root"),
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 删除
+    let req = delete_req("/api/v0/files/temp/cache.tmp", "baize-root");
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // 再读取应 404
+    let req = get_req_with_agent("/api/v0/files/temp/cache.tmp", "baize-root");
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_file_delete_records_audit() {
+    let app = test_app();
+
+    // 写入
+    let req = post_json(
+        "/api/v0/files/data/info.txt",
+        json!({"content": "info"}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 删除
+    let req = delete_req("/api/v0/files/data/info.txt", "baize-root");
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // 审计应有 file_delete 记录
+    let req = get_req("/api/v0/audit?type=file_delete");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let records = body["records"].as_array().unwrap();
+    assert!(records.iter().any(|r| r["type"] == "file_delete"));
+}
+
+#[tokio::test]
+async fn test_file_zone_check_blocks() {
+    let app = test_app();
+
+    // 注册 scope=["A"] 的 agent
+    let req = post_json(
+        "/api/v0/agents",
+        json!({"name": "zone-a", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 尝试写入 zone B 的文件 → 应被拒
+    let req = post_json(
+        "/api/v0/files/B/secret.txt",
+        json!({"content": "forbidden"}),
+        Some("zone-a"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body["error"].as_str().unwrap().contains("permission denied"));
+}
+
+#[tokio::test]
+async fn test_file_zone_root_accessible() {
+    let app = test_app();
+
+    // 注册 scope=["A"] 的 agent
+    let req = post_json(
+        "/api/v0/agents",
+        json!({"name": "zone-a", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // root 写入根级文件（无 / 前缀段）
+    let req = post_json(
+        "/api/v0/files/README.md",
+        json!({"content": "# Hello"}),
+        Some("baize-root"),
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // zone-a agent 可以读取根级文件（无 zone 限制）
+    let req = get_req_with_agent("/api/v0/files/README.md", "zone-a");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["content"], "# Hello");
+}
+
+#[tokio::test]
+async fn test_file_list() {
+    let app = test_app();
+
+    // 写入两个文件
+    let req = post_json(
+        "/api/v0/files/A/one.txt",
+        json!({"content": "one"}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+    let req = post_json(
+        "/api/v0/files/A/two.txt",
+        json!({"content": "two"}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 列出 root workspace 的文件
+    let req = get_req_with_agent("/api/v0/files", "baize-root");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let files = body["files"].as_array().unwrap();
+    assert!(files.len() >= 2);
+    assert!(files.iter().any(|f| f.as_str() == Some("A/one.txt")));
+    assert!(files.iter().any(|f| f.as_str() == Some("A/two.txt")));
+}
+
+#[tokio::test]
+async fn test_file_level0_cannot_write() {
+    let app = test_app();
+
+    // 注册 Level 0 sandbox agent
+    let req = post_json(
+        "/api/v0/agents",
+        json!({"name": "sandbox", "level": 0, "zones": []}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // sandbox 尝试写入文件 → 应被拒
+    let req = post_json(
+        "/api/v0/files/data.txt",
+        json!({"content": "sandbox write"}),
+        Some("sandbox"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body["error"].as_str().unwrap().contains("permission denied"));
 }

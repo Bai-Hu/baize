@@ -1,13 +1,14 @@
-# PromptHub HTTP API 应用场景
+# 白泽 HTTP API 应用场景
 
 ## 1. 定位
 
-PromptHub 是纯粹的 **prompt 基础设施**。不内置仲裁器、不绑定 LLM 后端、不预定义协作模式。
+白泽是 **Agent 治理基础设施** — 管理身份、权限、审计和数据同步。不内置仲裁器、不绑定 LLM 后端、不预定义协作模式。
 
 核心原则：
+- blob = 鉴权凭证（记录"谁在什么权限下做了什么"）
+- 主仓库 = Git 仓库（版本管理交给 Git）
 - 提供标准数据结构 + 可扩展字段（labels）
 - 暴露输入/输出分离的 API，上层系统自由组合
-- 所有 LLM 调用由外部完成，PromptHub 只管存储和查询
 
 ---
 
@@ -15,30 +16,27 @@ PromptHub 是纯粹的 **prompt 基础设施**。不内置仲裁器、不绑定 
 
 | 场景 | 核心价值 | 状态 |
 |------|---------|------|
-| 外部 Agent 管理 prompt | agent 通过 API 记录 prompt-response，上下文用 hash 而非原文，减少 token 消耗 | API 已支持 |
-| 模型行为量化 | 存储相似 prompt 的多模型响应，量化退化、一致性、成本 | 需补全 token 计数 + labels |
-| CI/CD 质量门控 | prompt 变更自动评估，评估能力由外部提供，PromptHub 管理流程 | 需新增评估 API |
-| 多 Agent 协作 | PromptHub 作为仲裁器的数据层，提供存储和查询，仲裁逻辑由上层实现 | 需补全 labels 查询 |
+| Agent 管理 prompt-response | 通过 blob + labels 记录交互，支持多模型对比 | API 已支持 |
+| 多 Agent 协作 | 白泽作为数据层，push/pull 实现跨 Agent 文件同步 | API 已支持 |
+| Agent ↔ 主仓库 | push 推送文件到主仓库工作区，用户审批后 git commit | API 已支持 |
+| 模型行为量化 | 存储相似 prompt 的多模型响应，量化退化、一致性 | 需补全 token 计数 labels |
+| CI/CD 质量门控 | prompt 变更自动评估，评估能力由外部提供 | 需新增评估 API |
 | Web 前端后端 | 先补全 API，Web UI 后做 | 暂不做 |
-| 开源 prompt 基础设施 | 远景方向 | 远景 |
 | 模型训练优化 | 数据集版本管理 + 多模型对比 | 远景 |
 
 ---
 
-## 3. 场景 1：外部 Agent 管理 Prompt
+## 3. 场景 1：Agent 记录 Prompt-Response
 
-### 3.1 记录层 — 减少 token 消耗
+### 3.1 通过 blob + labels 记录交互
 
-agent 执行时，把完整的 prompt 和 response 存入 PromptHub，上下文窗口只保留 hash：
+Agent 执行时，把 prompt 和 response 存为 blob，通过 labels 标记角色：
 
 ```
 agent 产生一次交互
     ↓
-POST /blobs { role: "user", content: "长 prompt..." }  → 返回 hash
-POST /blobs { role: "model", content: "长 response..." } → 返回 hash
-POST /pairs  { prompt_hash, response_hash, model }      → 配对
-    ↓
-agent 上下文里只记 3 个 hash（固定长度），不记原文
+POST /blobs { content: "长 prompt...", labels: { role: "prompt", model: "claude" } }  → 返回 hash
+POST /blobs { content: "长 response...", labels: { role: "response", parent: "<hash>" } } → 返回 hash
     ↓
 后续需要时 GET /blobs/{hash} 按需拉取
 ```
@@ -50,186 +48,101 @@ agent 上下文里只记 3 个 hash（固定长度），不记原文
 - **上下文退化** — prompt 加到多长时质量开始下降
 - **执行一致性** — 同一 prompt 多次执行，结果是否稳定
 
-需要的增量能力：
-- Token 计数（`input_tokens` / `output_tokens`）→ 通过 labels 存储
-- 按模型/标签聚合查询 → 通过 labels 查询实现
-
----
-
-## 4. 场景 2：CI/CD 质量门控
-
-### 4.1 输入/输出分离的评估 API
-
-PromptHub 不做 LLM 调用，只管理评估流程：
-
+通过 labels 查询实现聚合：
 ```
-CI Pipeline 创建评估任务:
-POST /evaluations { proposal_id, input: "评估这个 prompt...", labels: {...} }
-       → 返回 evaluation_id
-
-外部评估器（LLM / 规则引擎 / 人工）执行评估:
-       ↓
-
-评估器写入结果:
-POST /evaluations/{id}/result {
-    quality_passed: true,
-    score: 0.85,
-    issues: [...],
-    findings: {...}
-}
-```
-
-评估器可以是任意实现：Claude、GPT、本地模型、代码规则、人工标注。
-
-### 4.2 效果对比（非文本 diff）
-
-两个版本之间的"差异"不是文字 diff，而是**行为对比**：
-
-```
-POST /comparisons {
-    type: "session",
-    ref_a: "session-v1",
-    ref_b: "session-v2",
-    labels: { purpose: "prompt-regression" }
-}
-
-评估器写入对比结果:
-POST /comparisons/{id}/result {
-    metrics: {
-        quality:  { a: 0.6, b: 0.85, delta: +0.25 },
-        tokens:   { a: 500, b: 300, delta: -200 },
-        turns:    { a: 3, b: 1, delta: -2 },
-    },
-    verdict: "improved",
-    summary: "v2 prompt 效果更好，token 消耗更低"
-}
+POST /blobs/query { labels: { model: "claude", session_id: "xxx" } }
 ```
 
 ---
 
-## 5. 场景 3：多 Agent 协作
+## 4. 场景 2：多 Agent 协作
 
-### 5.1 PromptHub 是数据层，不是仲裁器
+### 4.1 白泽是数据层，不是仲裁器
 
 ```
 ┌──────────────┐
 │   仲裁器      │  ← 决策层（上层实现）：任务分配、路由、冲突解决
-│  （不在 PH）  │
+│  （不在白泽）  │
 └──────┬───────┘
        │ 读写
        ↓
 ┌──────────────┐
-│  PromptHub    │  ← 数据层：存储 + 版本管理 + 可扩展 labels
+│  白泽          │  ← 数据层：blob 鉴权 + labels 查询 + push/pull 同步
 │  API          │
 └──────────────┘
 ```
 
-### 5.2 append-only 模型
-
-blob 不可变，不需要更新状态。任务是否完成 = 链上是否有后续记录：
+### 4.2 Agent ↔ Agent：通过 blob 通讯
 
 ```
-blob 1 (agent-A): "实现排序算法"          ← 任务
-blob 2 (agent-B): "已实现，代码如下..."    ← 执行结果
-blob 3 (agent-A): "缺少测试"              ← 反馈
-blob 4 (agent-B): "已补充测试"            ← 修复
+Agent A push(blob+data) → 白泽 → Agent B pull(blob+query)
 ```
 
-"完成"不是一个字段状态，而是最后一条记录的内容。
+- Agent 通过 `blob/write` 推送交互数据
+- 仲裁器通过 `blob/query` 拉取线程内所有 Agent 的数据
+- labels 标记跨 agent 的关联（thread_id, from, to, msg_type）
 
-### 5.3 labels 支持仲裁器需求
+### 4.3 Agent ↔ 主仓库：通过 push/pull 同步
 
-仲裁器通过 labels 标记跨 agent 的关联：
-
-```json
-{
-  "labels": {
-    "from": "arbitrator",
-    "to": "agent-a",
-    "thread_id": "task-calc-001",
-    "parent": "abc123...",
-    "msg_type": "task"
-  }
-}
+```
+Agent workspace ──push──→ 主仓库工作区 ──用户审批──→ git commit → Git 历史
+Agent workspace ←──pull── 主仓库工作区（按 zone 过滤）
 ```
 
-PromptHub 不解释这些字段的语义，只负责存储和查询。
+- Agent push: workspace 文件推到主仓库工作区，等待用户审批
+- Agent pull: 从主仓库工作区拉取文件到 workspace（按 zone 过滤）
 
 ---
 
-## 6. 可扩展数据结构：Labels
+## 5. 场景 3：Zone 隔离
 
-### 6.1 设计
-
-**blob 新增 `labels: HashMap<String, String>`**
-
-用户可扩展的 key-value 对，用于存储任何结构化元数据。
-
-**存储：EAV 表（Entity-Attribute-Value）**
-
-```sql
-CREATE TABLE blob_labels (
-    blob_hash TEXT NOT NULL REFERENCES blobs(hash),
-    key TEXT NOT NULL,
-    value TEXT NOT NULL
-);
-CREATE INDEX idx_blob_labels_key_value ON blob_labels(key, value);
-CREATE INDEX idx_blob_labels_hash ON blob_labels(blob_hash);
-```
-
-**查询：**
+文件路径的首段视为 zone，Agent 只能操作自己 zone 范围内的文件：
 
 ```
-GET /blobs?labels.thread_id=task-001&labels.from=arbitrator
+Agent alice (zones: A, B)
+  ✅ file write A/config.yaml
+  ✅ file write B/data.txt
+  ❌ file write C/secret.yaml   — zone C 不在 scope 内
+
+alice push → 主仓库只有 A/ 和 B/ 的文件
+bob (zones: C) pull → 只能拉到 C/ 的文件，A/B 被静默跳过
 ```
 
-### 6.2 各场景使用 labels 的方式
+---
+
+## 6. 场景 4：审计追踪
+
+所有写操作自动生成审计 blob：
+
+```
+file write → 审计 blob (type: file_write, agent: alice, result: success)
+push       → 审计 blob (type: push, agent: alice, result: success files=3)
+blob write → 审计 blob (type: blob_write, agent: alice, result: success)
+```
+
+通过 `GET /api/v0/audit` 查询审计日志，支持按 agent 和 type 过滤。
+
+---
+
+## 7. Labels 扩展机制
+
+labels 是挂在 blob 上的 key-value 元数据，append-only：
 
 | 场景 | labels 示例 |
 |------|------------|
-| Agent 记录 | `input_tokens: "150"`, `output_tokens: "320"`, `from: "agent-a"` |
-| CI/CD | `pipeline: "github-actions"`, `branch: "prompt-42"`, `eval_result: "pass"` |
-| 多 Agent | `thread_id: "task-001"`, `from: "arbitrator"`, `to: "agent-b"`, `msg_type: "task"` |
-| 训练数据 | `dataset: "v2"`, `split: "train"`, `quality: "high"` |
-
----
-
-## 7. 需要补全的 API 端点
-
-### 高优先级
-
-| 端点 | 说明 |
-|------|------|
-| labels 查询 | `GET /blobs?labels.xxx=yyy` — EAV 表查询 |
-| 评估输入 | `POST /evaluations` — 创建评估任务 |
-| 评估输出 | `POST /evaluations/{id}/result` — 写入评估结果 |
-| 对比输入 | `POST /comparisons` — 创建对比任务 |
-| 对比输出 | `POST /comparisons/{id}/result` — 写入对比结果 |
-| 对比查询 | `GET /comparisons` — 查询对比历史 |
-
-### 中优先级
-
-| 端点 | 说明 |
-|------|------|
-| `GET /export` | 导出 JSON/CSV |
-| `GET /search?q=xxx` | 全文搜索（FTS5） |
-| `GET /sessions` | session 列表 + 详情 |
-
-### 底层数据结构变更
-
-| 变更 | 说明 |
-|------|------|
-| `blob_labels` 表 | EAV 表 + 索引（新增） |
-| `NewPrompt` 加 `labels` | `HashMap<String, String>`（扩展） |
-| `comparisons` 表 | 对比任务 + 结果（新增） |
-| evaluations 扩展 | 输入/输出分离（修改） |
+| Agent 交互 | `role: "prompt"`, `model: "claude"`, `session_id: "xxx"` |
+| 多 Agent | `thread_id: "task-001"`, `from: "arbitrator"`, `to: "agent-b"` |
+| 审计 | `x-audit: "true"`, `x-audit-type: "push"`, `x-audit-agent: "alice"` |
+| 导入数据 | `imported: "true"`, `source: "unittest"`, `trust-level: "2"` |
+| Push 鉴权 | `type: "push-auth"`, `agent: "alice"` |
 
 ---
 
 ## 8. 设计原则总结
 
-1. **PromptHub 是纯粹的基础设施** — 不内置仲裁器、不绑定 LLM、不预定义协作模式
-2. **输入/输出分离** — 评估和对比的 API 只管存储，执行由外部完成
-3. **labels 可扩展** — 标准数据结构 + 用户自定义 key-value，支持高效查询
-4. **append-only** — blob 不可变，状态通过链上记录推断，不修改历史
-5. **效果对比而非文本 diff** — 两个版本之间比较的是行为差异（质量、成本、轮次），不是文字差异
+1. **白泽是治理基础设施** — 身份、权限、审计、数据同步
+2. **blob = 鉴权凭证** — 记录操作，不是数据存储
+3. **主仓库 = Git 仓库** — 版本管理交给 Git，白泽管理 push/pull 工作流
+4. **labels 可扩展** — 标准数据结构 + 用户自定义 key-value
+5. **push ≠ git commit** — Agent push 到工作区，用户审批后 git commit
+6. **Zone 隔离** — Agent 只能操作自己 zone 范围内的文件

@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use baize_core::scope::{ElevationMode, Level};
 use baize_core::ROOT_AGENT_ID;
+use baize_server::pipeline::{
+    AgentRegistry, ElevationManager, DataOps, FileSync, GitOps,
+};
 use baize_server::Baize;
 use clap::{Parser, Subcommand};
 
@@ -39,12 +42,6 @@ enum Commands {
         action: BlobAction,
     },
 
-    /// Commit 操作
-    Commit {
-        #[command(subcommand)]
-        action: CommitAction,
-    },
-
     /// Label 操作
     Label {
         #[command(subcommand)]
@@ -66,17 +63,17 @@ enum Commands {
         action: ElevateAction,
     },
 
-    /// 追溯查询
+    /// 追溯查询（身份链）
     Trace {
-        /// 数据 hash 或 identity id
+        /// agent id
         target: String,
-        /// 身份链追溯
-        #[arg(long)]
-        identity: bool,
     },
 
     /// 审计日志
     Audit,
+
+    /// 仓库统计
+    Stats,
 
     /// 导入外部数据
     Import {
@@ -196,21 +193,6 @@ enum BlobAction {
 }
 
 #[derive(Subcommand)]
-enum CommitAction {
-    /// 创建 commit
-    Create {
-        #[arg(long, value_delimiter = ',')]
-        blobs: Vec<String>,
-        #[arg(short, long)]
-        message: String,
-        #[arg(long)]
-        parent: Option<String>,
-        #[arg(long, default_value = ROOT_AGENT_ID)]
-        agent: String,
-    },
-}
-
-#[derive(Subcommand)]
 enum LabelAction {
     /// 追加 label
     Add {
@@ -230,24 +212,21 @@ enum LabelAction {
 
 #[derive(Subcommand)]
 enum RefAction {
-    /// 设置 ref
-    Set {
-        name: String,
-        commit_hash: String,
-        #[arg(long, default_value = ROOT_AGENT_ID)]
-        agent: String,
-    },
-    /// 获取 ref
+    /// 获取 Git ref
     Get {
         name: String,
     },
-    /// 删除 ref
+    /// 设置 Git ref
+    Set {
+        name: String,
+        /// Git commit OID
+        oid: String,
+    },
+    /// 删除 Git ref（不可删除 HEAD）
     Delete {
         name: String,
-        #[arg(long, default_value = ROOT_AGENT_ID)]
-        agent: String,
     },
-    /// 列出 ref
+    /// 列出 Git refs
     List,
 }
 
@@ -424,19 +403,6 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        Commands::Commit { action } => {
-            let baize = open_baize()?;
-            match action {
-                CommitAction::Create { blobs, message, parent, agent } => {
-                    let commit = baize.pipe_commit_create(&agent, &blobs, &message, parent.as_deref())?;
-                    println!("Commit 创建成功: {}", commit.hash);
-                    println!("  Message: {}", commit.message);
-                    println!("  Blobs: {:?}", commit.blob_hashes);
-                }
-            }
-            Ok(())
-        }
-
         Commands::Label { action } => {
             let baize = open_baize()?;
             match action {
@@ -458,23 +424,23 @@ fn main() -> anyhow::Result<()> {
         Commands::Ref { action } => {
             let baize = open_baize()?;
             match action {
-                RefAction::Set { name, commit_hash, agent } => {
-                    baize.pipe_ref_set(&agent, &name, &commit_hash)?;
-                    println!("Ref 设置成功: {} → {}", name, commit_hash);
-                }
                 RefAction::Get { name } => {
-                    let r = baize.storage.ref_get(&name)?;
-                    println!("{} → {}", r.name, r.commit_hash);
+                    let oid = baize.git_ref_get(&name)?;
+                    println!("{} → {}", name, oid);
                 }
-                RefAction::Delete { name, agent } => {
-                    baize.pipe_ref_delete(&agent, &name)?;
-                    println!("Ref {} 已删除", name);
+                RefAction::Set { name, oid } => {
+                    baize.git_ref_set(&name, &oid)?;
+                    println!("Ref 设置成功: {} → {}", name, oid);
+                }
+                RefAction::Delete { name } => {
+                    baize.git_ref_delete(&name)?;
+                    println!("Ref 已删除: {}", name);
                 }
                 RefAction::List => {
-                    let refs = baize.storage.ref_list()?;
-                    println!("Refs ({}):", refs.len());
+                    let refs = baize.git_ref_list()?;
+                    println!("Git Refs ({}):", refs.len());
                     for r in refs {
-                        println!("  {} → {}", r.name, r.commit_hash);
+                        println!("  {}", r);
                     }
                 }
             }
@@ -483,17 +449,17 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Log => {
             let baize = open_baize()?;
-            let commits = baize.storage.commit_log(None)?;
-            if commits.is_empty() {
-                println!("(无 commit)");
-            } else {
-                for c in commits {
-                    let author_str = c.author.as_deref().unwrap_or("-");
-                    println!("{} {} ({})", &c.hash[..12.min(c.hash.len())], c.message, author_str);
-                    if let Some(ref p) = c.parent_hash {
-                        println!("  parent: {}", &p[..12.min(p.len())]);
+            match baize.git_log(50) {
+                Ok(commits) => {
+                    if commits.is_empty() {
+                        println!("(无 git commit)");
+                    } else {
+                        for c in commits {
+                            println!("{} {} ({})", &c.hash[..12.min(c.hash.len())], c.message, c.author);
+                        }
                     }
                 }
+                Err(_) => println!("(主仓库无 Git 历史或未初始化)"),
             }
             Ok(())
         }
@@ -537,21 +503,13 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        Commands::Trace { target, identity } => {
+        Commands::Trace { target } => {
             let baize = open_baize()?;
-            if identity {
-                let chain = baize.trace_identity(&target)?;
-                println!("身份链 ({} 级):", chain.len());
-                for id in &chain {
-                    println!("  {} | L{} | zones {:?} | parent {:?}",
-                        id.agent_id, id.level, id.zones, id.parent_id);
-                }
-            } else {
-                let chain = baize.trace_data(&target)?;
-                println!("数据链 ({} 级):", chain.len());
-                for c in &chain {
-                    println!("  {} {}", &c.hash[..12.min(c.hash.len())], c.message);
-                }
+            let chain = baize.trace_identity(&target)?;
+            println!("身份链 ({} 级):", chain.len());
+            for id in &chain {
+                println!("  {} | L{} | zones {:?} | parent {:?}",
+                    id.agent_id, id.level, id.zones, id.parent_id);
             }
             Ok(())
         }
@@ -568,6 +526,20 @@ fn main() -> anyhow::Result<()> {
                     b.labels.get("x-audit-type").unwrap_or(&"-".to_string()),
                     b.labels.get("x-audit-agent").unwrap_or(&"-".to_string()),
                 );
+            }
+            Ok(())
+        }
+
+        Commands::Stats => {
+            let baize = open_baize()?;
+            match baize.repo_stats() {
+                Ok(stats) => {
+                    println!("仓库统计:");
+                    println!("  Blobs:   {}", stats.total_blobs);
+                    println!("  Commits: {}", stats.total_commits);
+                    println!("  Refs:    {}", stats.total_refs);
+                }
+                Err(e) => println!("获取统计失败: {}", e),
             }
             Ok(())
         }
@@ -629,8 +601,9 @@ fn main() -> anyhow::Result<()> {
             let baize = open_baize()?;
             let result = baize.pipe_push(&agent, &message, r#ref.as_deref())?;
             println!("Push 成功: {} 个文件", result.files);
-            println!("  Commit: {}", result.commit_hash);
-            println!("  Ref: {}", result.ref_name);
+            if result.pending {
+                println!("  状态: 等待用户审批 git commit");
+            }
             Ok(())
         }
 
@@ -638,8 +611,6 @@ fn main() -> anyhow::Result<()> {
             let baize = open_baize()?;
             let result = baize.pipe_pull(&agent, r#ref.as_deref())?;
             println!("Pull 成功: {} 个文件", result.files);
-            println!("  Commit: {}", result.commit_hash);
-            println!("  Ref: {}", result.ref_name);
             Ok(())
         }
 

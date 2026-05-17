@@ -16,23 +16,6 @@ pub struct Blob {
 }
 
 #[derive(Debug, Clone)]
-pub struct Commit {
-    pub hash: String,
-    pub message: String,
-    pub author: Option<String>,
-    pub parent_hash: Option<String>,
-    pub blob_hashes: Vec<String>,
-    pub labels: HashMap<String, String>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct Ref {
-    pub name: String,
-    pub commit_hash: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct Label {
     pub entity_hash: String,
     pub key: String,
@@ -64,25 +47,6 @@ impl Storage {
                 hash       TEXT PRIMARY KEY,
                 content    TEXT NOT NULL,
                 created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS commits (
-                hash        TEXT PRIMARY KEY,
-                message     TEXT NOT NULL,
-                author      TEXT,
-                parent_hash TEXT,
-                created_at  TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS commit_blobs (
-                commit_hash TEXT NOT NULL,
-                blob_hash   TEXT NOT NULL,
-                PRIMARY KEY (commit_hash, blob_hash)
-            );
-
-            CREATE TABLE IF NOT EXISTS refs (
-                name        TEXT PRIMARY KEY,
-                commit_hash TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS labels (
@@ -235,15 +199,37 @@ impl Storage {
     }
 
     pub fn blob_query(&self, filter: &HashMap<String, String>) -> Result<Vec<Blob>> {
-        let hashes = self.query_hashes_by_labels(filter)?;
+        self.blob_query_paginated(filter, None, None)
+    }
+
+    /// 按 labels 查询 blob（支持分页）
+    pub fn blob_query_paginated(
+        &self,
+        filter: &HashMap<String, String>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<Blob>> {
+        let hashes = self.query_hashes_by_labels(filter, limit, offset)?;
         self.load_blobs_batch(&hashes)
     }
 
     /// 根据 label filter 查询匹配的 entity hash 列表
     /// AND 语义：所有 filter 条件必须同时满足
-    fn query_hashes_by_labels(&self, filter: &HashMap<String, String>) -> Result<Vec<String>> {
+    fn query_hashes_by_labels(
+        &self,
+        filter: &HashMap<String, String>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<String>> {
         if filter.is_empty() {
-            let mut stmt = self.db.prepare("SELECT hash FROM blobs ORDER BY created_at DESC")?;
+            let mut sql = "SELECT hash FROM blobs ORDER BY created_at DESC".to_string();
+            if let Some(lim) = limit {
+                sql.push_str(&format!(" LIMIT {}", lim));
+            }
+            if let Some(off) = offset {
+                sql.push_str(&format!(" OFFSET {}", off));
+            }
+            let mut stmt = self.db.prepare(&sql)?;
             let hashes: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(0))?.filter_map(|r| r.ok()).collect();
             return Ok(hashes);
         }
@@ -254,11 +240,17 @@ impl Storage {
             .enumerate()
             .map(|(i, _)| format!("(key = ?{} AND value = ?{})", i * 2 + 1, i * 2 + 2))
             .collect();
-        let sql = format!(
+        let mut sql = format!(
             "SELECT entity_hash FROM labels WHERE {} GROUP BY entity_hash HAVING COUNT(DISTINCT key) = {}",
             conditions.join(" OR "),
             filter.len()
         );
+        if let Some(lim) = limit {
+            sql.push_str(&format!(" LIMIT {}", lim));
+            if let Some(off) = offset {
+                sql.push_str(&format!(" OFFSET {}", off));
+            }
+        }
         let mut stmt = self.db.prepare(&sql)?;
         let mut sql_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         for (k, v) in &filter_vec {
@@ -268,6 +260,15 @@ impl Storage {
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params.iter().map(|p| p.as_ref()).collect();
         let hashes: Vec<String> = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))?.filter_map(|r| r.ok()).collect();
         Ok(hashes)
+    }
+
+    pub fn blob_count(&self) -> Result<i64> {
+        let count: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM blobs",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     fn blob_exists(&self, hash: &str) -> Result<bool> {
@@ -292,7 +293,7 @@ impl Storage {
 
     /// 只查询 hash + labels（不加载 blob content），用于审计等只需要元数据的场景
     pub fn blob_query_metadata(&self, filter: &HashMap<String, String>) -> Result<Vec<(String, HashMap<String, String>)>> {
-        let hashes = self.query_hashes_by_labels(filter)?;
+        let hashes = self.query_hashes_by_labels(filter, None, None)?;
         let mut results = Vec::new();
         for hash in hashes {
             let labels = self.load_entity_labels(&hash)?;
@@ -301,220 +302,12 @@ impl Storage {
         Ok(results)
     }
 
-    // ─── Commit 操作 ───
-
-    pub fn commit_create(&self, blob_hashes: &[String], message: &str, parent_hash: Option<&str>, author: Option<&str>, labels: &HashMap<String, String>) -> Result<Commit> {
-        if blob_hashes.is_empty() {
-            return Err(Error::Validation("commit must contain at least one blob".into()));
-        }
-
-        // 验证所有 blob 存在
-        for bh in blob_hashes {
-            if !self.blob_exists(bh)? {
-                return Err(Error::NotFound(format!("blob {}", bh)));
-            }
-        }
-
-        // 验证 parent 存在（如果指定）
-        if let Some(ph) = parent_hash {
-            if !self.commit_exists(ph)? {
-                return Err(Error::NotFound(format!("commit (parent) {}", ph)));
-            }
-        }
-
-        // commit hash = SHA-256(排序后的 blob hashes + parent + message + author)
-        let mut hasher = Sha256::new();
-        let mut sorted = blob_hashes.to_vec();
-        sorted.sort();
-        for bh in &sorted {
-            hasher.update(bh.as_bytes());
-        }
-        if let Some(ph) = parent_hash {
-            hasher.update(ph.as_bytes());
-        }
-        hasher.update(message.as_bytes());
-        if let Some(a) = author {
-            hasher.update(a.as_bytes());
-        }
-        let hash = format!("{:x}", hasher.finalize());
-
-        let created_at = Utc::now().to_rfc3339();
-
-        let tx = self.db.unchecked_transaction()?;
-
-        tx.execute(
-            "INSERT INTO commits (hash, message, author, parent_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![hash, message, author, parent_hash, created_at],
-        )?;
-
-        for bh in &sorted {
-            tx.execute(
-                "INSERT INTO commit_blobs (commit_hash, blob_hash) VALUES (?1, ?2)",
-                params![hash, bh],
-            )?;
-        }
-
-        for (k, v) in labels {
-            tx.execute(
-                "INSERT INTO labels (entity_hash, key, value) VALUES (?1, ?2, ?3)",
-                params![hash, k, v],
-            )?;
-        }
-
-        // 同一事务内更新 HEAD
-        tx.execute(
-            "INSERT OR REPLACE INTO refs (name, commit_hash) VALUES ('HEAD', ?1)",
-            params![hash],
-        )?;
-
-        tx.commit()?;
-
-        Ok(Commit {
-            hash,
-            message: message.to_string(),
-            author: author.map(String::from),
-            parent_hash: parent_hash.map(String::from),
-            blob_hashes: sorted,
-            labels: labels.clone(),
-            created_at,
-        })
-    }
-
-    pub fn commit_log(&self, from_hash: Option<&str>) -> Result<Vec<Commit>> {
-        let start = match from_hash {
-            Some(h) => h.to_string(),
-            None => {
-                // 从 HEAD 开始
-                match self.ref_get("HEAD") {
-                    Ok(r) => r.commit_hash,
-                    Err(_) => return Ok(vec![]),
-                }
-            }
-        };
-
-        let mut commits = Vec::new();
-        let mut current = Some(start);
-
-        while let Some(hash) = current {
-            let commit = self.commit_read(&hash)?;
-            current = commit.parent_hash.clone();
-            commits.push(commit);
-        }
-
-        Ok(commits)
-    }
-
-    pub fn commit_read(&self, hash: &str) -> Result<Commit> {
-        let (message, author, parent_hash, created_at) = self.db.query_row(
-            "SELECT message, author, parent_hash, created_at FROM commits WHERE hash = ?1",
-            params![hash],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        ).map_err(|_| Error::NotFound(format!("commit {}", hash)))?;
-
-        let blob_hashes = self.load_commit_blobs(hash)?;
-        let labels = self.load_entity_labels(hash)?;
-        Ok(Commit {
-            hash: hash.to_string(),
-            message,
-            author,
-            parent_hash,
-            blob_hashes,
-            labels,
-            created_at,
-        })
-    }
-
-    fn commit_exists(&self, hash: &str) -> Result<bool> {
-        let count: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM commits WHERE hash = ?1",
-            params![hash],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
-    fn load_commit_blobs(&self, hash: &str) -> Result<Vec<String>> {
-        let mut stmt = self.db.prepare(
-            "SELECT blob_hash FROM commit_blobs WHERE commit_hash = ?1",
-        )?;
-        let hashes: Vec<String> = stmt
-            .query_map(params![hash], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(hashes)
-    }
-
-    /// 查找包含指定 blob 的所有 commit hash
-    pub fn commits_containing_blob(&self, blob_hash: &str) -> Result<Vec<String>> {
-        let mut stmt = self.db.prepare(
-            "SELECT commit_hash FROM commit_blobs WHERE blob_hash = ?1",
-        )?;
-        let hashes: Vec<String> = stmt
-            .query_map(params![blob_hash], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(hashes)
-    }
-
-    // ─── Ref 操作 ───
-
-    pub fn ref_set(&self, name: &str, commit_hash: &str) -> Result<()> {
-        if !self.commit_exists(commit_hash)? {
-            return Err(Error::NotFound(format!("commit {}", commit_hash)));
-        }
-        self.db.execute(
-            "INSERT OR REPLACE INTO refs (name, commit_hash) VALUES (?1, ?2)",
-            params![name, commit_hash],
-        )?;
-        Ok(())
-    }
-
-    pub fn ref_get(&self, name: &str) -> Result<Ref> {
-        let commit_hash = self.db.query_row(
-            "SELECT commit_hash FROM refs WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        ).map_err(|_| Error::NotFound(format!("ref {}", name)))?;
-        Ok(Ref {
-            name: name.to_string(),
-            commit_hash,
-        })
-    }
-
-    pub fn ref_delete(&self, name: &str) -> Result<()> {
-        if name == "HEAD" {
-            return Err(Error::Validation("cannot delete HEAD ref".into()));
-        }
-        let rows = self.db.execute(
-            "DELETE FROM refs WHERE name = ?1",
-            params![name],
-        )?;
-        if rows == 0 {
-            return Err(Error::NotFound(format!("ref {}", name)));
-        }
-        Ok(())
-    }
-
-    pub fn ref_list(&self) -> Result<Vec<Ref>> {
-        let mut stmt = self.db.prepare("SELECT name, commit_hash FROM refs ORDER BY name")?;
-        let refs = stmt
-            .query_map([], |row| {
-                Ok(Ref {
-                    name: row.get(0)?,
-                    commit_hash: row.get(1)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(refs)
-    }
-
-    // ─── Label 操作（通用，挂载在 blob 或 commit 上） ───
+    // ─── Label 操作（挂在 blob 上） ───
 
     pub fn label_add(&self, entity_hash: &str, key: &str, value: &str) -> Result<()> {
-        // 检查实体是否存在（blob 或 commit）
-        if !self.blob_exists(entity_hash)? && !self.commit_exists(entity_hash)? {
-            return Err(Error::NotFound(format!("entity {}", entity_hash)));
+        // 检查 blob 是否存在
+        if !self.blob_exists(entity_hash)? {
+            return Err(Error::NotFound(format!("blob {}", entity_hash)));
         }
 
         // 检查 key 是否已存在（LABEL_CONFLICT）
@@ -715,162 +508,6 @@ mod tests {
         let results = db.blob_query(&filter).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "both");
-    }
-
-    // ─── Commit ───
-
-    fn write_blobs(db: &Storage, contents: &[&str]) -> Vec<String> {
-        contents.iter().map(|c| {
-            db.blob_write(c, &HashMap::new()).unwrap().hash
-        }).collect()
-    }
-
-    #[test]
-    fn commit_create_and_read() {
-        let db = open_db();
-        let hashes = write_blobs(&db, &["blob1", "blob2"]);
-        let commit = db.commit_create(&hashes, "first commit", None, None, &HashMap::new()).unwrap();
-        assert!(!commit.hash.is_empty());
-        assert_eq!(commit.message, "first commit");
-        assert!(commit.parent_hash.is_none());
-        assert_eq!(commit.blob_hashes.len(), 2);
-
-        let read = db.commit_read(&commit.hash).unwrap();
-        assert_eq!(read.hash, commit.hash);
-        assert_eq!(read.message, "first commit");
-    }
-
-    #[test]
-    fn commit_create_empty_blobs_fails() {
-        let db = open_db();
-        let result = db.commit_create(&[], "empty", None, None, &HashMap::new());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn commit_create_nonexistent_blob_fails() {
-        let db = open_db();
-        let result = db.commit_create(&["deadbeef".to_string()], "bad", None, None, &HashMap::new());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn commit_create_nonexistent_parent_fails() {
-        let db = open_db();
-        let hashes = write_blobs(&db, &["x"]);
-        let result = db.commit_create(&hashes, "orphan", Some("nope"), None, &HashMap::new());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn commit_chain_and_log() {
-        let db = open_db();
-        let h1 = write_blobs(&db, &["a"]);
-        let c1 = db.commit_create(&h1, "first", None, None, &HashMap::new()).unwrap();
-
-        let h2 = write_blobs(&db, &["b"]);
-        let c2 = db.commit_create(&h2, "second", Some(&c1.hash), None, &HashMap::new()).unwrap();
-
-        let log = db.commit_log(None).unwrap();
-        assert_eq!(log.len(), 2);
-        assert_eq!(log[0].hash, c2.hash);
-        assert_eq!(log[1].hash, c1.hash);
-    }
-
-    #[test]
-    fn commit_log_from_hash() {
-        let db = open_db();
-        let h1 = write_blobs(&db, &["a"]);
-        let c1 = db.commit_create(&h1, "first", None, None, &HashMap::new()).unwrap();
-
-        let h2 = write_blobs(&db, &["b"]);
-        let _c2 = db.commit_create(&h2, "second", Some(&c1.hash), None, &HashMap::new()).unwrap();
-
-        // 从 c1 开始
-        let log = db.commit_log(Some(&c1.hash)).unwrap();
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].hash, c1.hash);
-    }
-
-    #[test]
-    fn commit_log_empty() {
-        let db = open_db();
-        let log = db.commit_log(None).unwrap();
-        assert!(log.is_empty());
-    }
-
-    #[test]
-    fn commit_updates_head() {
-        let db = open_db();
-        let hashes = write_blobs(&db, &["x"]);
-        let c = db.commit_create(&hashes, "init", None, None, &HashMap::new()).unwrap();
-        let head = db.ref_get("HEAD").unwrap();
-        assert_eq!(head.commit_hash, c.hash);
-    }
-
-    #[test]
-    fn commit_create_with_author_and_labels() {
-        let db = open_db();
-        let hashes = write_blobs(&db, &["data1"]);
-        let mut labels = HashMap::new();
-        labels.insert("env".to_string(), "test".to_string());
-        let c = db.commit_create(&hashes, "authored commit", None, Some("agent-001"), &labels).unwrap();
-        assert_eq!(c.author.as_deref(), Some("agent-001"));
-        assert_eq!(c.labels["env"], "test");
-    }
-
-    #[test]
-    fn commit_read_returns_labels() {
-        let db = open_db();
-        let hashes = write_blobs(&db, &["data"]);
-        let mut labels = HashMap::new();
-        labels.insert("tier".to_string(), "prod".to_string());
-        let c = db.commit_create(&hashes, "labeled", None, Some("root"), &labels).unwrap();
-
-        let read = db.commit_read(&c.hash).unwrap();
-        assert_eq!(read.author.as_deref(), Some("root"));
-        assert_eq!(read.labels["tier"], "prod");
-    }
-
-    // ─── Ref ───
-
-    #[test]
-    fn ref_set_get_delete() {
-        let db = open_db();
-        let hashes = write_blobs(&db, &["x"]);
-        let c = db.commit_create(&hashes, "init", None, None, &HashMap::new()).unwrap();
-
-        db.ref_set("my-branch", &c.hash).unwrap();
-        let r = db.ref_get("my-branch").unwrap();
-        assert_eq!(r.commit_hash, c.hash);
-
-        db.ref_delete("my-branch").unwrap();
-        assert!(db.ref_get("my-branch").is_err());
-    }
-
-    #[test]
-    fn ref_delete_head_fails() {
-        let db = open_db();
-        let result = db.ref_delete("HEAD");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn ref_get_nonexistent() {
-        let db = open_db();
-        assert!(db.ref_get("nope").is_err());
-    }
-
-    #[test]
-    fn ref_list() {
-        let db = open_db();
-        let hashes = write_blobs(&db, &["x"]);
-        let c = db.commit_create(&hashes, "init", None, None, &HashMap::new()).unwrap();
-
-        db.ref_set("main", &c.hash).unwrap();
-        let refs = db.ref_list().unwrap();
-        // HEAD + main = 2
-        assert_eq!(refs.len(), 2);
     }
 
     // ─── Label ───

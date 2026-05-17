@@ -5,12 +5,15 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{request::Parts, StatusCode},
-    routing::{get, post, delete},
+    routing::{get, post, put, delete},
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::pipeline::Baize;
+use crate::pipeline::{
+    Baize,
+    AgentRegistry, ElevationManager, DataOps, FileSync, GitOps,
+};
 use baize_core::scope::{ElevationMode, Level};
 
 // ─── 错误辅助 ───
@@ -69,23 +72,21 @@ pub fn app(baize: Baize) -> Router {
         .route("/api/v0/blobs", post(blob_write))
         .route("/api/v0/blobs/{hash}", get(blob_read))
         .route("/api/v0/blobs/query", post(blob_query))
-        // Commit 操作
-        .route("/api/v0/commits", post(commit_create))
-        .route("/api/v0/log", get(commit_log))
+        // Git log
+        .route("/api/v0/log", get(git_log_handler))
         // Label 操作
         .route("/api/v0/labels", post(label_add))
         .route("/api/v0/labels/query", get(label_query))
-        // Ref 操作
-        .route("/api/v0/refs", post(ref_set))
-        .route("/api/v0/refs/{name}", get(ref_get))
-        .route("/api/v0/refs/{name}", delete(ref_delete))
-        .route("/api/v0/refs", get(ref_list))
+        // Git refs
+        .route("/api/v0/refs", get(git_ref_list_handler))
+        .route("/api/v0/refs/{name}", get(git_ref_get_handler))
+        .route("/api/v0/refs/{name}", put(git_ref_set_handler))
+        .route("/api/v0/refs/{name}", delete(git_ref_delete_handler))
         // Elevation
         .route("/api/v0/elevation", post(elevation_request))
         .route("/api/v0/elevation/{id}/approve", post(elevation_approve))
         .route("/api/v0/elevation", get(elevation_list))
         // Trace
-        .route("/api/v0/trace/data/{hash}", get(trace_data))
         .route("/api/v0/trace/identity/{id}", get(trace_identity))
         // Import/Export
         .route("/api/v0/import", post(import_data))
@@ -100,6 +101,8 @@ pub fn app(baize: Baize) -> Router {
         // Push / Pull
         .route("/api/v0/push", post(push))
         .route("/api/v0/pull", post(pull))
+        // Repo
+        .route("/api/v0/repo/stats", get(repo_stats_handler))
         .with_state(state)
 }
 
@@ -138,13 +141,8 @@ struct BlobResponse {
 #[derive(Deserialize)]
 struct BlobQueryRequest {
     labels: std::collections::HashMap<String, String>,
-}
-
-#[derive(Deserialize)]
-struct CommitCreateRequest {
-    blob_hashes: Vec<String>,
-    message: String,
-    parent_hash: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -155,18 +153,17 @@ struct LabelAddRequest {
 }
 
 #[derive(Deserialize)]
-struct RefSetRequest {
-    name: String,
-    commit_hash: String,
-}
-
-#[derive(Deserialize)]
 struct ElevationRequestDto {
     agent_id: String,
     zones: Vec<String>,
     mode: String,
     reason: String,
     duration: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LogQueryParams {
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -298,7 +295,7 @@ async fn blob_query(
     Json(req): Json<BlobQueryRequest>,
 ) -> impl IntoResponse {
     let baize = state.lock().await;
-    match baize.storage.blob_query(&req.labels) {
+    match baize.storage.blob_query_paginated(&req.labels, req.limit, req.offset) {
         Ok(blobs) => {
             let results: Vec<BlobResponse> = blobs.into_iter().map(|b| BlobResponse {
                 hash: b.hash,
@@ -312,38 +309,19 @@ async fn blob_query(
     }
 }
 
-async fn commit_create(
+async fn git_log_handler(
     State(state): State<AppState>,
-    agent: AgentId,
-    Json(req): Json<CommitCreateRequest>,
+    Query(params): Query<LogQueryParams>,
 ) -> impl IntoResponse {
     let baize = state.lock().await;
-    match baize.pipe_commit_create(&agent.0, &req.blob_hashes, &req.message, req.parent_hash.as_deref()) {
-        Ok(commit) => (StatusCode::CREATED, Json(serde_json::json!({
-            "hash": commit.hash,
-            "message": commit.message,
-            "author": commit.author,
-            "parent_hash": commit.parent_hash,
-            "blob_hashes": commit.blob_hashes,
-            "labels": commit.labels,
-            "created_at": commit.created_at,
-        }))).into_response(),
-        Err(e) => map_error(e),
-    }
-}
-
-async fn commit_log(State(state): State<AppState>) -> impl IntoResponse {
-    let baize = state.lock().await;
-    match baize.storage.commit_log(None) {
+    let limit = params.limit.unwrap_or(50).min(200);
+    match baize.git_log(limit) {
         Ok(commits) => Json(serde_json::json!({
             "commits": commits.iter().map(|c| serde_json::json!({
                 "hash": c.hash,
                 "message": c.message,
                 "author": c.author,
-                "parent_hash": c.parent_hash,
-                "blob_hashes": c.blob_hashes,
-                "labels": c.labels,
-                "created_at": c.created_at,
+                "time": c.time,
             })).collect::<Vec<_>>()
         })).into_response(),
         Err(e) => map_error(e),
@@ -386,50 +364,51 @@ async fn label_query(
     }
 }
 
-async fn ref_set(
-    State(state): State<AppState>,
-    agent: AgentId,
-    Json(req): Json<RefSetRequest>,
-) -> impl IntoResponse {
+async fn git_ref_list_handler(State(state): State<AppState>) -> impl IntoResponse {
     let baize = state.lock().await;
-    match baize.pipe_ref_set(&agent.0, &req.name, &req.commit_hash) {
-        Ok(()) => StatusCode::CREATED.into_response(),
+    match baize.git_ref_list() {
+        Ok(refs) => Json(serde_json::json!({"refs": refs})).into_response(),
         Err(e) => map_error(e),
     }
 }
 
-async fn ref_get(
+async fn git_ref_get_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     let baize = state.lock().await;
-    match baize.storage.ref_get(&name) {
-        Ok(r) => Json(serde_json::json!({"name": r.name, "commit_hash": r.commit_hash})).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    match baize.git_ref_get(&name) {
+        Ok(oid) => Json(serde_json::json!({"name": name, "oid": oid})).into_response(),
+        Err(e) => map_error(e),
     }
 }
 
-async fn ref_delete(
+#[derive(Deserialize)]
+struct RefSetRequest {
+    oid: String,
+}
+
+async fn git_ref_set_handler(
     State(state): State<AppState>,
-    agent: AgentId,
+    _agent: AgentId,
     Path(name): Path<String>,
+    Json(req): Json<RefSetRequest>,
 ) -> impl IntoResponse {
     let baize = state.lock().await;
-    match baize.pipe_ref_delete(&agent.0, &name) {
+    match baize.git_ref_set(&name, &req.oid) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => map_error(e),
     }
 }
 
-async fn ref_list(State(state): State<AppState>) -> impl IntoResponse {
+async fn git_ref_delete_handler(
+    State(state): State<AppState>,
+    _agent: AgentId,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
     let baize = state.lock().await;
-    match baize.storage.ref_list() {
-        Ok(refs) => Json(serde_json::json!({
-            "refs": refs.iter().map(|r| serde_json::json!({
-                "name": r.name,
-                "commit_hash": r.commit_hash,
-            })).collect::<Vec<_>>()
-        })).into_response(),
+    match baize.git_ref_delete(&name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => map_error(e),
     }
 }
@@ -492,23 +471,6 @@ async fn elevation_list(State(state): State<AppState>) -> impl IntoResponse {
         obj
     }).collect();
     Json(serde_json::json!({"requests": items})).into_response()
-}
-
-async fn trace_data(
-    State(state): State<AppState>,
-    Path(hash): Path<String>,
-) -> impl IntoResponse {
-    let baize = state.lock().await;
-    match baize.trace_data(&hash) {
-        Ok(chain) => Json(serde_json::json!({
-            "chain": chain.iter().map(|c| serde_json::json!({
-                "hash": c.hash,
-                "message": c.message,
-                "created_at": c.created_at,
-            })).collect::<Vec<_>>()
-        })).into_response(),
-        Err(e) => map_error(e),
-    }
 }
 
 async fn trace_identity(
@@ -601,6 +563,7 @@ async fn audit_query(
                 "type": labels.get("x-audit-type").unwrap_or(&"-".to_string()),
                 "agent": labels.get("x-audit-agent").unwrap_or(&"-".to_string()),
                 "result": labels.get("x-audit-result").unwrap_or(&"-".to_string()),
+                "target": labels.get("x-audit-target").unwrap_or(&"-".to_string()),
                 "time": labels.get("x-audit-time").unwrap_or(&"-".to_string()),
             })).collect::<Vec<_>>()
         })).into_response(),
@@ -679,9 +642,8 @@ async fn push(
     let baize = state.lock().await;
     match baize.pipe_push(&agent.0, &req.message, req.r#ref.as_deref()) {
         Ok(result) => (StatusCode::CREATED, Json(serde_json::json!({
-            "commit_hash": result.commit_hash,
             "files": result.files,
-            "ref": result.ref_name,
+            "pending": result.pending,
         }))).into_response(),
         Err(e) => map_error(e),
     }
@@ -695,9 +657,21 @@ async fn pull(
     let baize = state.lock().await;
     match baize.pipe_pull(&agent.0, req.r#ref.as_deref()) {
         Ok(result) => Json(serde_json::json!({
-            "commit_hash": result.commit_hash,
             "files": result.files,
-            "ref": result.ref_name,
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// ─── Repo Stats ───
+
+async fn repo_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.repo_stats() {
+        Ok(stats) => Json(serde_json::json!({
+            "total_blobs": stats.total_blobs,
+            "total_commits": stats.total_commits,
+            "total_refs": stats.total_refs,
         })).into_response(),
         Err(e) => map_error(e),
     }

@@ -9,7 +9,7 @@
 
 ## 认证
 
-写操作（POST/DELETE）需要在请求头中携带 agent 身份：
+写操作（POST/PUT/DELETE）需要在请求头中携带 agent 身份：
 
 ```
 x-agent-id: <agent-id>
@@ -188,31 +188,36 @@ POST /api/v0/blobs/query
   "labels": {
     "key1": "value1",
     "key2": "value2"
-  }
+  },
+  "limit": 50,
+  "offset": 0
 }
 ```
 
-**响应** `200 OK`: Blob 数组，满足 AND 语义（所有 label 条件同时匹配）。
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| labels | object | 是 | 查询条件，AND 语义 |
+| limit | uint | 否 | 返回数量上限 |
+| offset | uint | 否 | 跳过前 N 条记录 |
 
-```json
-[
-  {
-    "hash": "...",
-    "content": "...",
-    "labels": { ... },
-    "created_at": "..."
-  }
-]
-```
+**响应** `200 OK`: Blob 数组，满足 AND 语义（所有 label 条件同时匹配）。
 
 ---
 
-## Commit 操作
+## Push / Pull
 
-### 创建 Commit
+Agent 与主仓库之间的数据同步操作。主仓库是 Git 仓库。
+
+**白泽 push ≠ git commit：**
+- 白泽 push = Agent 将 workspace 文件推送到主仓库工作区。blob 鉴权后即可执行。
+- git commit = 主仓库更新 Git 版本历史。**需要用户审批**，不由 Agent 触发。
+
+### Push（workspace → 主仓库工作区）
+
+将 agent workspace 文件推送到主仓库工作区。文件到达后等待用户审批 git commit。
 
 ```
-POST /api/v0/commits
+POST /api/v0/push
 ```
 
 **认证**: 需要 `x-agent-id`
@@ -220,38 +225,85 @@ POST /api/v0/commits
 **请求体**:
 ```json
 {
-  "blob_hashes": ["hash1", "hash2"],
-  "message": "commit 描述",
-  "parent_hash": "parent-commit-hash"
+  "message": "提交描述",
+  "ref": "shared"
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| blob_hashes | string[] | 是 | 包含的 blob hash 列表，不可为空 |
-| message | string | 是 | 提交描述 |
-| parent_hash | string | 否 | 父 commit hash |
+| message | string | 是 | 提交描述（用于后续 git commit） |
+| ref | string | 否 | 目标 ref（保留，暂未使用） |
 
 **成功响应** `201 Created`:
 ```json
 {
-  "hash": "...",
-  "message": "commit 描述",
-  "author": "agent-id",
-  "parent_hash": "parent-commit-hash",
-  "blob_hashes": ["hash1", "hash2"],
-  "labels": {},
-  "created_at": "2026-05-16T05:30:00+00:00"
+  "files": 3,
+  "pending": true
 }
 ```
 
-### 查看 Commit 日志
+**执行流程**:
+1. 验证 agent 身份和 zone 权限（blob 鉴权）
+2. workspace 文件写入主仓库工作区
+3. 创建鉴权 blob，记录本次操作
+4. 文件在主仓库工作区等待用户审批
+
+### Pull（主仓库工作区 → workspace）
+
+从主仓库工作区拉取文件到 agent workspace。无 zone 权限的文件被静默跳过。
 
 ```
-GET /api/v0/log
+POST /api/v0/pull
+```
+
+**认证**: 需要 `x-agent-id`
+
+**请求体**:
+```json
+{
+  "ref": "shared"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| ref | string | 否 | 来源 Git ref（保留，暂未使用） |
+
+**成功响应** `200 OK`:
+```json
+{
+  "files": 3
+}
+```
+
+**执行流程**:
+1. 验证 agent 身份和 zone 权限
+2. 清空 agent workspace
+3. 从主仓库工作区遍历文件，按 zone 过滤后复制到 workspace
+4. 审计记录
+
+**注意**: pull 会清空 workspace。调用方必须保证先 pull 再 write，否则 write 的内容会被 pull 清空。
+
+**流程**: Alice push → 文件到达主仓库工作区 → Bob pull → Bob workspace 获得文件（仅限 Bob 有权限的 zone）。
+
+---
+
+## Git 操作
+
+### 查看 Git 日志
+
+查看主仓库 Git 日志。
+
+```
+GET /api/v0/log?limit=50
 ```
 
 无需认证。
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| limit | 否 | 返回数量上限，默认 50，最大 200 |
 
 **响应** `200 OK`:
 ```json
@@ -260,15 +312,82 @@ GET /api/v0/log
     {
       "hash": "...",
       "message": "...",
-      "author": "agent-id",
-      "parent_hash": "...",
-      "blob_hashes": ["..."],
-      "labels": {},
-      "created_at": "..."
+      "author": "...",
+      "time": "..."
     }
   ]
 }
 ```
+
+---
+
+## Ref 操作（Git ref）
+
+Ref 对应主仓库 Git 的 branch/tag。操作直接映射到 Git ref。
+
+### 列出 Ref
+
+```
+GET /api/v0/refs
+```
+
+无需认证。
+
+**响应** `200 OK`:
+```json
+{
+  "refs": ["main", "stable", "v1"]
+}
+```
+
+### 获取 Ref
+
+```
+GET /api/v0/refs/{name}
+```
+
+无需认证。
+
+**响应** `200 OK`:
+```json
+{
+  "name": "stable",
+  "oid": "a1b2c3..."
+}
+```
+
+### 设置 Ref
+
+```
+PUT /api/v0/refs/{name}
+```
+
+**认证**: 需要 `x-agent-id`
+
+**请求体**:
+```json
+{
+  "oid": "git-commit-oid"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| oid | string | 是 | Git commit OID（40 字符 hex） |
+
+**响应**: `204 No Content`（成功）。
+
+**规则**: OID 必须指向一个已存在的 git commit。如果 ref 已存在则更新，否则创建。
+
+### 删除 Ref
+
+```
+DELETE /api/v0/refs/{name}
+```
+
+**认证**: 需要 `x-agent-id`
+
+**响应**: `204 No Content`。`HEAD` 不可删除。
 
 ---
 
@@ -285,13 +404,15 @@ POST /api/v0/labels
 **请求体**:
 ```json
 {
-  "entity_hash": "blob-or-commit-hash",
+  "entity_hash": "blob-hash",
   "key": "label-key",
   "value": "label-value"
 }
 ```
 
-**响应**: `201 Created`（成功，无 body）。同一 (entity_hash, key, value) 组合重复添加返回 `409 Conflict`。
+**规则**: label 只能挂在 blob 上。同一 (entity_hash, key) 组合重复添加返回 `409 Conflict`。
+
+**响应**: `201 Created`（成功，无 body）。
 
 ### 查询 Label
 
@@ -315,74 +436,6 @@ GET /api/v0/labels/query?key=<key>&value=<value>
       "key": "env",
       "value": "production"
     }
-  ]
-}
-```
-
----
-
-## Ref 操作
-
-### 设置 Ref
-
-```
-POST /api/v0/refs
-```
-
-**认证**: 需要 `x-agent-id`
-
-**请求体**:
-```json
-{
-  "name": "stable",
-  "commit_hash": "commit-hash"
-}
-```
-
-**响应**: `201 Created`（成功，无 body）。
-
-特殊 ref `HEAD` 由系统自动管理（commit 创建时指向最新 commit），不可手动删除。
-
-### 获取 Ref
-
-```
-GET /api/v0/refs/{name}
-```
-
-无需认证。
-
-**响应** `200 OK`:
-```json
-{
-  "name": "stable",
-  "commit_hash": "..."
-}
-```
-
-### 删除 Ref
-
-```
-DELETE /api/v0/refs/{name}
-```
-
-**认证**: 需要 `x-agent-id`
-
-**响应**: `204 No Content`。`HEAD` ref 不可删除。
-
-### 列出 Ref
-
-```
-GET /api/v0/refs
-```
-
-无需认证。
-
-**响应** `200 OK`:
-```json
-{
-  "refs": [
-    { "name": "HEAD", "commit_hash": "..." },
-    { "name": "stable", "commit_hash": "..." }
   ]
 }
 ```
@@ -433,7 +486,7 @@ POST /api/v0/elevation/{id}/approve
 
 **响应** `200 OK`:
 ```json
-{ "status": "approved" }
+{ "status": "Approved" }
 ```
 
 **规则**:
@@ -457,7 +510,7 @@ POST /api/v0/elevation/{id}/return
 
 **响应** `200 OK`:
 ```json
-{ "status": "returned" }
+{ "status": "Returned" }
 ```
 
 ### 列出借权记录
@@ -475,7 +528,7 @@ GET /api/v0/elevation
     {
       "id": "...",
       "agent_id": "agent-name",
-      "mode": "ReadOnly",
+      "mode": "readonly",
       "reason": "原因",
       "status": "Approved",
       "created_at": "...",
@@ -490,32 +543,6 @@ status 枚举: `Pending` / `Approved` / `Expired` / `Revoked` / `Returned`
 ---
 
 ## 追溯（Trace）
-
-### 数据追溯
-
-给定 commit hash 或 blob hash，返回关联的 commit 链。
-
-- **commit hash**: 直接沿 parent 链向上追溯
-- **blob hash**: 先找到包含该 blob 的 commit，再沿 parent 链向上追溯
-
-```
-GET /api/v0/trace/data/{hash}
-```
-
-无需认证。
-
-**响应** `200 OK`:
-```json
-{
-  "chain": [
-    {
-      "hash": "...",
-      "message": "commit 描述",
-      "created_at": "..."
-    }
-  ]
-}
-```
 
 ### 身份追溯
 
@@ -597,7 +624,8 @@ GET /api/v0/export/{hash}
 {
   "hash": "...",
   "content": "数据内容",
-  "labels": { ... }
+  "labels": { ... },
+  "created_at": "..."
 }
 ```
 
@@ -618,7 +646,7 @@ GET /api/v0/audit
 | 参数 | 说明 |
 |------|------|
 | agent | 按操作 agent 过滤 |
-| type | 按操作类型过滤（如 `blob_write`、`commit_create`） |
+| type | 按操作类型过滤（如 `blob_write`、`push`、`file_write`） |
 
 **响应** `200 OK`:
 ```json
@@ -629,6 +657,7 @@ GET /api/v0/audit
       "type": "blob_write",
       "agent": "agent-name",
       "result": "success",
+      "target": "config/app.yaml",
       "time": "2026-05-16T05:30:00+00:00"
     }
   ]
@@ -729,80 +758,35 @@ GET /api/v0/files
 
 ---
 
-## Push / Pull
-
-PromptHub 核心概念：workspace 与主仓库之间的同步操作。
-
-### Push（workspace → 主仓库）
-
-将 agent workspace 所有文件快照为一次 commit，更新 ref。
+## 仓库统计
 
 ```
-POST /api/v0/push
+GET /api/v0/repo/stats
 ```
 
-**认证**: 需要 `x-agent-id`
+无需认证。
 
-**请求体**:
+**响应** `200 OK`:
 ```json
 {
-  "message": "提交描述",
-  "ref": "shared"
+  "total_blobs": 42,
+  "total_commits": 10,
+  "total_refs": 3
 }
 ```
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| message | string | 是 | 提交描述 |
-| ref | string | 否 | 目标 ref，默认 `HEAD` |
-
-**成功响应** `201 Created`:
-```json
-{
-  "commit_hash": "...",
-  "files": 3,
-  "ref": "shared"
-}
-```
-
-### Pull（主仓库 → workspace）
-
-从 ref 指向的 commit 中提取所有文件，写入 agent workspace。
-
-```
-POST /api/v0/pull
-```
-
-**认证**: 需要 `x-agent-id`
-
-**请求体**:
-```json
-{
-  "ref": "shared"
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| ref | string | 否 | 来源 ref，默认 `HEAD` |
-
-**成功响应** `200 OK`:
-```json
-{
-  "commit_hash": "...",
-  "files": 3,
-  "ref": "shared"
-}
-```
-
-**流程**: Alice push 到 `shared` ref → Bob pull `shared` ref → Bob workspace 获得与 Alice 相同的文件。
+| 字段 | 说明 |
+|------|------|
+| total_blobs | 数据库中的 blob 总数 |
+| total_commits | 主仓库 Git commit 总数 |
+| total_refs | 主仓库 Git ref 总数 |
 
 ---
 
 ## CLI 速查
 
 ```
-bz init                                    # 初始化仓库
+bz init                                    # 初始化仓库（含 Git 初始化）
 bz serve --addr 127.0.0.1:3000             # 启动 HTTP 服务
 
 bz agent register <NAME> --level 3 --zones zone-a,zone-b [--parent <ID>]
@@ -814,25 +798,26 @@ bz blob write --content "..." [--labels k=v,k2=v2] [--agent <ID>]
 bz blob read <hash>
 bz blob query [--labels k=v]
 
-bz commit create --blobs h1,h2 --message "..." [--parent <hash>] [--agent <ID>]
-bz log
+bz push -m "message" [--ref <name>] [--agent <ID>]
+bz pull [--ref <name>] [--agent <ID>]
+bz log                                     # 主仓库 Git 日志
+
+bz ref get <name>                          # 获取 Git ref
+bz ref set <name> <oid>                    # 设置 Git ref
+bz ref delete <name>                       # 删除 Git ref（不可删 HEAD）
+bz ref list                                # 列出 Git refs
 
 bz label add <hash> <key> <value> [--agent <ID>]
 bz label query <key> [--value <val>]
-
-bz ref set <name> <commit-hash> [--agent <ID>]
-bz ref get <name>
-bz ref delete <name> [--agent <ID>]
-bz ref list
 
 bz elevate request --agent <ID> --zones zone-a --mode readonly --reason "..." [--duration 2h]
 bz elevate approve <request-id> [--agent <ID>]
 bz elevate return <request-id> --agent <ID>
 bz elevate list
 
-bz trace <hash>                            # 数据追溯（commit hash 或 blob hash）
-bz trace --identity <agent-id>             # 身份追溯
+bz trace <agent-id>                        # 身份链追溯
 bz audit                                   # 查看审计日志
+bz stats                                   # 仓库统计
 
 bz import <file> --source <source> [--trust-level 2] [--agent <ID>]
 bz export <hash> --output <path> [--agent <ID>]
@@ -841,9 +826,6 @@ bz file write <path> --content "..." [--labels k=v] [--agent <ID>]
 bz file read <path> [--agent <ID>]
 bz file rm <path> [--agent <ID>]
 bz file ls [--agent <ID>]
-
-bz push -m "message" [--ref <name>] [--agent <ID>]
-bz pull [--ref <name>] [--agent <ID>]
 ```
 
 ---
@@ -869,9 +851,14 @@ zone 是字符串标签，用于数据隔离。agent 只能操作自己 zone 范
 
 1. 子 agent 的 level 必须 **严格小于** 父 agent
 2. 子 agent 的 zones 必须 **是父 zones 的子集**（父含 `"*"` 时无限制）
-3. 同一内容的 blob 写入是 **幂等的**
-4. root agent **不可撤销**
-5. `HEAD` ref **不可删除**
-6. 所有写操作 **自动审计**
-7. 文件路径首段（`/` 之前）视为 **zone**，受 agent scope 约束
-8. 文件操作 Level 0 agent **不可写入**
+3. blob 是 **鉴权凭证**，不是数据存储
+4. 每个 blob **MUST 有 `type` label**，标明凭证用途
+5. blob content **推荐 JSON**；PEM、hash 等格式视场景允许
+6. 主仓库是 **Git 仓库**，版本管理由 Git 原生提供
+7. 白泽 push ≠ git commit：push 推送文件到工作区，git commit 由用户审批后执行
+8. 同一内容的 blob 写入是 **幂等的**
+9. root agent **不可撤销**
+10. `HEAD` ref **不可删除**
+11. 所有写操作 **自动审计**（通过 `type: "audit"` 的鉴权 blob 记录）
+12. 文件路径首段（`/` 之前）视为 **zone**，受 agent scope 约束
+13. 文件操作 Level 0 agent **不可写入**

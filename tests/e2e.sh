@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 白泽 E2E 测试
-# 测试 CLI 二进制的完整生命周期场景
+# 测试 CLI 二进制的完整 Agent 治理生命周期
+# 架构：blob = 鉴权凭证，主仓库 = Git 仓库，push/pull = workspace ↔ 主仓库
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -63,26 +64,27 @@ assert_output_contains() {
 }
 
 extract_hash() {
-    # 从 "Blob 写入成功: <hash>" 或 "Commit 创建成功: <hash>" 提取 hash
-    # 只取第一个出现的 64 位 hex（即 commit/blob hash，忽略后续的 blob hash 列表）
     echo "$1" | grep -oP '[0-9a-f]{64}' | head -1 | tr -d '\n'
 }
 
 extract_elev_id() {
-    # 从 "借权申请已提交: <hash>" 提取 hash（64 位 hex）
     echo "$1" | grep -oP '[0-9a-f]{64}' | head -1 | tr -d '\n'
 }
 
-# ─── 场景 1: 完整数据生命周期 ───
-# init → blob → commit → log → ref → label → trace → audit
+# ─── 场景 1: 完整 Agent 数据生命周期 ───
+# init → register agent → file write → push → log → ref → label → audit → stats
 
 test_full_lifecycle() {
-    echo "=== 场景 1: 完整数据生命周期 ==="
+    echo "=== 场景 1: 完整 Agent 数据生命周期 ==="
     setup
 
-    # init (使用默认路径 baize.db + .baize/workspaces)
+    # init
     assert_ok "init" $BZ init
     [ -f baize.db ] || { FAIL=$((FAIL + 1)); echo "FAIL: db file not created"; TOTAL=$((TOTAL + 1)); }
+
+    # register agent
+    out=$($BZ agent register worker --level 2 --zones A,B)
+    assert_output_contains "worker registered" "注册成功" "$out"
 
     # blob write
     out=$($BZ blob write --content "hello baize" --labels "type=greeting,lang=zh")
@@ -99,45 +101,49 @@ test_full_lifecycle() {
     out=$($BZ blob query --labels "type=greeting")
     assert_output_contains "blob query result" "$BLOB_HASH" "$out"
 
-    # commit
-    out=$($BZ commit create --blobs "$BLOB_HASH" -m "initial commit")
-    assert_output_contains "commit success" "创建成功" "$out"
-    COMMIT_HASH=$(extract_hash "$out")
-    [ -n "$COMMIT_HASH" ] || { FAIL=$((FAIL + 1)); echo "FAIL: no commit hash"; TOTAL=$((TOTAL + 1)); }
+    # file write to workspace
+    out=$($BZ file write A/config.yaml --content "key: value" --agent worker)
+    assert_output_contains "file write success" "写入成功" "$out"
+    out=$($BZ file write A/data.txt --content "agent data" --agent worker)
+    assert_output_contains "file write 2" "写入成功" "$out"
 
-    # log
+    # file list
+    out=$($BZ file ls --agent worker)
+    assert_output_contains "file list has config" "config.yaml" "$out"
+    assert_output_contains "file list has data" "data.txt" "$out"
+
+    # push: workspace → 主仓库工作区
+    out=$($BZ push -m "worker initial files" --agent worker)
+    assert_output_contains "push success" "Push 成功" "$out"
+    assert_output_contains "push files" "2" "$out"
+    assert_output_contains "push pending" "等待用户审批" "$out"
+
+    # log (git log — 应该为空，因为还没有用户审批的 git commit)
     out=$($BZ log)
-    assert_output_contains "log shows commit" "initial commit" "$out"
+    assert_output_contains "log empty" "Git" "$out"
 
-    # ref
-    assert_ok "ref set" $BZ ref set v1 "$COMMIT_HASH"
-    out=$($BZ ref get v1)
-    assert_output_contains "ref get" "$COMMIT_HASH" "$out"
-
-    # ref list
+    # ref list (新仓库只有初始化时的 HEAD)
     out=$($BZ ref list)
-    assert_output_contains "ref list has v1" "v1" "$out"
+    assert_output_contains "ref list works" "Git Refs" "$out"
 
     # label
     assert_ok "label add" $BZ label add "$BLOB_HASH" "priority" "high"
     out=$($BZ label query priority --value high)
     assert_output_contains "label query" "$BLOB_HASH" "$out"
 
-    # trace data
-    out=$($BZ trace "$COMMIT_HASH")
-    assert_output_contains "trace data" "initial commit" "$out"
+    # trace identity (现在是唯一模式)
+    out=$($BZ trace worker)
+    assert_output_contains "trace worker" "worker" "$out"
+    assert_output_contains "trace root" "baize-root" "$out"
 
-    # audit (only export audit from this session)
-    # init doesn't audit, so audit log may be empty or have export audit
-    # Skip audit check for this scenario - covered in scenario 6
+    # stats
+    out=$($BZ stats)
+    assert_output_contains "stats blobs" "Blobs" "$out"
 
     teardown
 }
 
 # ─── 场景 2: Agent 注册 + 身份追溯 ───
-# 注意：CLI 每个命令独立打开 Baize 实例，agents 信息在内存中不跨命令保留。
-# delegate 需要父 agent 的 IssuerCtx 来签发子证书，这在 CLI 中无法跨命令完成。
-# 所以这里只测试直接注册 agent 的场景（issuer 是 root）。
 
 test_agent_registration() {
     echo "=== 场景 2: Agent 注册 + 身份追溯 ==="
@@ -145,18 +151,15 @@ test_agent_registration() {
 
     assert_ok "init" $BZ init
 
-    # register agent (parent = root, by default)
+    # register agent
     out=$($BZ agent register operator --level 3 --zones A,B,C)
     assert_output_contains "operator registered" "注册成功" "$out"
     assert_output_contains "operator level" "Level: 3" "$out"
 
-    # register another agent
     out=$($BZ agent register worker --level 2 --zones A)
     assert_output_contains "worker registered" "注册成功" "$out"
 
-    # list agents (independent open_baize: only root from init)
-    # agent list works because it reads from memory, but after reopen only root is there
-    # so we just verify the command succeeds
+    # list agents
     out=$($BZ agent list)
     assert_output_contains "list has root" "baize-root" "$out"
 
@@ -166,8 +169,7 @@ test_agent_registration() {
     teardown
 }
 
-# ─── 场景 3: Agent 委托链（单命令内通过 API 测试）───
-# 测试 pipeline 内部的委托能力
+# ─── 场景 3: Agent 委托链 + scope 校验 ───
 
 test_agent_delegation() {
     echo "=== 场景 3: Agent 委托链 + scope 校验 ==="
@@ -175,28 +177,25 @@ test_agent_delegation() {
 
     assert_ok "init" $BZ init
 
-    # 成功路径：注册父 agent，然后委托子 agent
+    # register parent → delegate child
     assert_ok "register parent" $BZ agent register ops --level 3 --zones A,B,C
     out=$($BZ agent delegate ops worker --level 2 --zones A)
     assert_output_contains "delegate success" "注册成功" "$out"
 
-    # 验证列表包含 root + ops + worker
     out=$($BZ agent list)
     assert_output_contains "list has ops" "ops" "$out"
     assert_output_contains "list has worker" "worker" "$out"
 
-    # scope exceed: child level > root level 4 should fail
+    # scope exceed
     assert_fail "invalid level 5" $BZ agent register bad --level 5 --zones A
 
-    # invalid zones for level 0 (0 zones allowed)
-    assert_ok "level 0 with zones (allowed, but cannot write)" $BZ agent register sandbox --level 0 --zones A
+    # level 0 is allowed (sandbox, cannot write)
+    assert_ok "level 0 sandbox" $BZ agent register sandbox --level 0 --zones A
 
     teardown
 }
 
 # ─── 场景 4: 借权流程 ───
-# 注意：elevation_request 需要 agent 在内存 HashMap 中。
-# CLI 每个命令独立 init，所以 elevation 只能对 baize-root 操作（因为 root 总在）。
 
 test_elevation_flow() {
     echo "=== 场景 4: 借权流程 ==="
@@ -204,13 +203,13 @@ test_elevation_flow() {
 
     assert_ok "init" $BZ init
 
-    # request elevation for root (root is always in memory)
+    # request elevation for root
     out=$($BZ elevate request --zones A --mode readonly --reason "test elevation" --agent baize-root)
     assert_output_contains "elevation requested" "借权申请已提交" "$out"
     ELEV_ID=$(extract_elev_id "$out")
     [ -n "$ELEV_ID" ] || { FAIL=$((FAIL + 1)); echo "FAIL: no elevation id"; TOTAL=$((TOTAL + 1)); }
 
-    # list pending (独立 open_baize，但 elevation 持久化在 SQLite 中)
+    # list pending
     out=$($BZ elevate list)
     assert_output_contains "elevation list" "baize-root" "$out"
 
@@ -265,7 +264,7 @@ test_import_export() {
 
     # query imported blobs
     out=$($BZ blob query --labels "imported=true")
-    assert_output_contains "query imported" "2" "$out"  # two imported blobs
+    assert_output_contains "query imported" "2" "$out"
 
     # path traversal should fail
     assert_fail "import path traversal" $BZ import ../../etc/passwd --source evil --trust-level 0
@@ -273,54 +272,78 @@ test_import_export() {
     teardown
 }
 
-# ─── 场景 6: Commit 链 + 数据追溯 ───
+# ─── 场景 6: Push/Pull 跨 Agent 协作 ───
 
-test_commit_chain_and_trace() {
-    echo "=== 场景 6: Commit 链 + 数据追溯 ==="
+test_push_pull_cross_agent() {
+    echo "=== 场景 6: Push/Pull 跨 Agent 协作 ==="
     setup
 
     assert_ok "init" $BZ init
 
-    # write 3 blobs
-    B1=$($BZ blob write --content "version 1" | grep -oP '[0-9a-f]{64}')
-    B2=$($BZ blob write --content "version 2" | grep -oP '[0-9a-f]{64}')
-    B3=$($BZ blob write --content "version 3" | grep -oP '[0-9a-f]{64}')
+    # 注册两个 agent
+    $BZ agent register alice --level 2 --zones A >/dev/null
+    $BZ agent register bob --level 2 --zones A >/dev/null
 
-    # commit chain: c1 → c2 → c3
-    C1=$($BZ commit create --blobs "$B1" -m "first" | head -1 | grep -oP '[0-9a-f]{64}')
-    C2=$($BZ commit create --blobs "$B2" -m "second" --parent "$C1" | head -1 | grep -oP '[0-9a-f]{64}')
-    C3=$($BZ commit create --blobs "$B3" -m "third" --parent "$C2" | head -1 | grep -oP '[0-9a-f]{64}')
+    # alice 写文件并 push
+    $BZ file write A/shared.txt --content "from alice" --agent alice >/dev/null
+    out=$($BZ push -m "alice's work" --agent alice)
+    assert_output_contains "alice push" "Push 成功" "$out"
+    assert_output_contains "alice push files" "1" "$out"
 
-    # log should show 3 commits (newest first)
-    out=$($BZ log)
-    assert_output_contains "log has third" "third" "$out"
-    assert_output_contains "log has second" "second" "$out"
-    assert_output_contains "log has first" "first" "$out"
+    # bob pull → 拿到 alice 的文件
+    out=$($BZ pull --agent bob)
+    assert_output_contains "bob pull" "Pull 成功" "$out"
+    assert_output_contains "bob pull files" "1" "$out"
 
-    # trace from c2 → c1
-    out=$($BZ trace "$C2")
-    assert_output_contains "trace c2" "second" "$out"
-    assert_output_contains "trace c2 parent" "first" "$out"
-
-    # HEAD should point to c3
-    out=$($BZ ref get HEAD)
-    assert_output_contains "head is c3" "$C3" "$out"
-
-    # ref operations
-    assert_ok "ref set stable" $BZ ref set stable "$C1"
-    out=$($BZ ref get stable)
-    assert_output_contains "stable ref" "$C1" "$out"
-
-    assert_ok "ref delete stable" $BZ ref delete stable
-    assert_fail "ref delete HEAD" $BZ ref delete HEAD
+    # 验证 bob 能读到 alice 的文件
+    out=$($BZ file read A/shared.txt --agent bob)
+    assert_output_contains "bob reads alice file" "from alice" "$out"
 
     teardown
 }
 
-# ─── 场景 7: 审计完整性 ───
+# ─── 场景 7: Zone 隔离 ───
+
+test_zone_isolation() {
+    echo "=== 场景 7: Zone 隔离 ==="
+    setup
+
+    assert_ok "init" $BZ init
+
+    # alice 有 zone A，bob 有 zone B
+    $BZ agent register alice --level 2 --zones A >/dev/null
+    $BZ agent register bob --level 2 --zones B >/dev/null
+
+    # alice 写 zone A 文件
+    $BZ file write A/data.txt --content "alice data" --agent alice >/dev/null
+
+    # alice 尝试写 zone B → 应失败
+    assert_fail "alice write zone B" $BZ file write B/evil.txt --content "hack" --agent alice
+
+    # alice push zone A 文件
+    $BZ push -m "alice zone A" --agent alice >/dev/null
+
+    # bob pull → 只有 zone B 文件被拉取（zone A 被跳过）
+    out=$($BZ pull --agent bob)
+    assert_output_contains "bob pull from alice" "Pull 成功" "$out"
+    # bob 的 workspace 应为空（只有 A 文件，bob 是 zone B）
+    out=$($BZ file ls --agent bob)
+    # bob 不应有 A/data.txt
+    TOTAL=$((TOTAL + 1))
+    if echo "$out" | grep -qF "A/data.txt"; then
+        FAIL=$((FAIL + 1))
+        echo "FAIL: bob should not see zone A files"
+    else
+        PASS=$((PASS + 1))
+    fi
+
+    teardown
+}
+
+# ─── 场景 8: 审计完整性 ───
 
 test_audit_integrity() {
-    echo "=== 场景 7: 审计完整性 ==="
+    echo "=== 场景 8: 审计完整性 ==="
     setup
 
     assert_ok "init" $BZ init
@@ -333,7 +356,19 @@ test_audit_integrity() {
     assert_output_contains "audit register" "agent_register" "$out"
     assert_output_contains "audit auditor" "auditor" "$out"
 
-    # export generates audit too
+    # file write generates audit
+    $BZ file write A/test.txt --content "audit test" --agent auditor >/dev/null
+
+    out=$($BZ audit)
+    assert_output_contains "audit file write" "file_write" "$out"
+
+    # push generates audit
+    $BZ push -m "audit test push" --agent auditor >/dev/null
+
+    out=$($BZ audit)
+    assert_output_contains "audit push" "push" "$out"
+
+    # export generates audit
     B1=$($BZ blob write --content "test" | grep -oP '[0-9a-f]{64}')
     $BZ export "$B1" --output "$TEST_DIR/out.txt" >/dev/null
 
@@ -343,11 +378,10 @@ test_audit_integrity() {
     teardown
 }
 
-# ─── 场景 8: 跨命令 Agent 委托链 ───
-# 验证 agent 状态跨命令持久化：register → delegate → trace → revoke
+# ─── 场景 9: 跨命令 Agent 委托链 ───
 
 test_cross_cmd_delegation() {
-    echo "=== 场景 8: 跨命令 Agent 委托链 ==="
+    echo "=== 场景 9: 跨命令 Agent 委托链 ==="
     setup
 
     assert_ok "init" $BZ init
@@ -361,14 +395,14 @@ test_cross_cmd_delegation() {
     assert_output_contains "worker delegated" "注册成功" "$out"
     assert_output_contains "worker parent" "ops" "$out"
 
-    # 列表显示 3 个 agent（root, ops, worker）
+    # 列表显示 3 个 agent
     out=$($BZ agent list)
     assert_output_contains "list has root" "baize-root" "$out"
     assert_output_contains "list has ops" "ops" "$out"
     assert_output_contains "list has worker" "worker" "$out"
 
     # trace identity worker → ops → root
-    out=$($BZ trace --identity worker)
+    out=$($BZ trace worker)
     assert_output_contains "trace worker" "worker" "$out"
     assert_output_contains "trace ops" "ops" "$out"
     assert_output_contains "trace root" "baize-root" "$out"
@@ -381,25 +415,20 @@ test_cross_cmd_delegation() {
     assert_output_contains "after revoke root" "baize-root" "$out"
     assert_output_contains "after revoke ops" "ops" "$out"
 
-    # 撤销不存在的 agent 应失败
     assert_fail "revoke ghost" $BZ agent revoke ghost
-
-    # scope 递减违规：child level > parent level 应失败
     assert_fail "scope exceed" $BZ agent delegate ops bad --level 4 --zones A
 
     teardown
 }
 
-# ─── 场景 9: 跨命令非 Root Agent 借权 ───
-# 验证注册的 agent 跨命令可以申请借权
+# ─── 场景 10: 跨命令非 Root Agent 借权 ───
 
 test_cross_cmd_elevation() {
-    echo "=== 场景 9: 跨命令非 Root Agent 借权 ==="
+    echo "=== 场景 10: 跨命令非 Root Agent 借权 ==="
     setup
 
     assert_ok "init" $BZ init
 
-    # 注册 agent
     $BZ agent register worker --level 2 --zones A,B >/dev/null
 
     # 跨命令：agent 状态恢复，worker 可申请借权
@@ -408,25 +437,22 @@ test_cross_cmd_elevation() {
     ELEV_ID=$(extract_elev_id "$out")
     [ -n "$ELEV_ID" ] || { FAIL=$((FAIL + 1)); echo "FAIL: no elevation id"; TOTAL=$((TOTAL + 1)); }
 
-    # 跨命令审批
     assert_ok "approve" $BZ elevate approve "$ELEV_ID"
 
-    # 验证已批准
     out=$($BZ elevate list)
     assert_output_contains "approved status" "Approved" "$out"
     assert_output_contains "elevation agent" "worker" "$out"
 
-    # 申请超出 scope 的 zone 也应成功（借权的意义就是获取超出 scope 的权限）
+    # 申请超出 scope 的 zone 也应成功
     assert_ok "zone beyond scope" $BZ elevate request --zones Z --mode readonly --reason "need Z" --agent worker
 
     teardown
 }
 
-# ─── 场景 10: 跨命令 Agent 状态恢复 ───
-# 验证多次 open_baize 后 agent 列表一致
+# ─── 场景 11: 跨命令 Agent 状态恢复 ───
 
 test_cross_cmd_agent_persistence() {
-    echo "=== 场景 10: 跨命令 Agent 状态恢复 ==="
+    echo "=== 场景 11: 跨命令 Agent 状态恢复 ==="
     setup
 
     assert_ok "init" $BZ init
@@ -443,16 +469,15 @@ test_cross_cmd_agent_persistence() {
     assert_output_contains "has gamma" "gamma" "$out"
     assert_output_contains "has root" "baize-root" "$out"
 
-    # 验证 trace identity gamma → alpha → root 链完整
-    out=$($BZ trace --identity gamma)
+    # trace identity gamma → alpha → root 链完整
+    out=$($BZ trace gamma)
     assert_output_contains "gamma chain" "gamma" "$out"
     assert_output_contains "gamma parent alpha" "alpha" "$out"
     assert_output_contains "gamma root" "baize-root" "$out"
 
-    # 撤销 alpha（gamma 仍存在但 parent 已不在内存中）
+    # 撤销 alpha
     assert_ok "revoke alpha" $BZ agent revoke alpha
 
-    # 列表应该没有 alpha（作为 agent ID，而非 parent 引用）
     out=$($BZ agent list)
     TOTAL=$((TOTAL + 1))
     if echo "$out" | grep -qP '^\s*alpha \|'; then
@@ -465,16 +490,14 @@ test_cross_cmd_agent_persistence() {
     teardown
 }
 
-# ─── 场景 11: 借权归还流程 ───
-# 注册 agent → 申请借权(duration) → 审批 → 归还 → 验证状态
+# ─── 场景 12: 借权归还流程 ───
 
 test_elevation_return() {
-    echo "=== 场景 11: 借权归还流程 ==="
+    echo "=== 场景 12: 借权归还流程 ==="
     setup
 
     assert_ok "init" $BZ init
 
-    # 注册 agent
     $BZ agent register worker --level 3 --zones A,B >/dev/null
 
     # 申请借权（带 duration）
@@ -483,19 +506,66 @@ test_elevation_return() {
     ELEV_ID=$(extract_elev_id "$out")
     [ -n "$ELEV_ID" ] || { FAIL=$((FAIL + 1)); echo "FAIL: no elevation id"; TOTAL=$((TOTAL + 1)); }
 
-    # 审批
     assert_ok "approve" $BZ elevate approve "$ELEV_ID"
 
-    # 验证已批准
     out=$($BZ elevate list)
     assert_output_contains "approved" "Approved" "$out"
 
     # 归还
     assert_ok "return" $BZ elevate return "$ELEV_ID" --agent worker
 
-    # 验证已归还
     out=$($BZ elevate list)
     assert_output_contains "returned" "Returned" "$out"
+
+    teardown
+}
+
+# ─── 场景 13: Push 后文件确实到达主仓库工作区 ───
+
+test_push_files_in_main_repo() {
+    echo "=== 场景 13: Push 后文件在主仓库工作区 ==="
+    setup
+
+    assert_ok "init" $BZ init
+    $BZ agent register writer --level 2 --zones X >/dev/null
+
+    # 写入多个文件并 push
+    $BZ file write X/app.py --content "print('hello')" --agent writer >/dev/null
+    $BZ file write X/config.json --content '{"port": 8080}' --agent writer >/dev/null
+    out=$($BZ push -m "v1" --agent writer)
+    assert_output_contains "push 2 files" "2" "$out"
+
+    # 验证文件在主仓库工作区（.baize/main/ 目录下）
+    TOTAL=$((TOTAL + 1))
+    if [ -f ".baize/main/X/app.py" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: X/app.py not found in main repo"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    if [ -f ".baize/main/X/config.json" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: X/config.json not found in main repo"
+    fi
+
+    teardown
+}
+
+# ─── 场景 14: Push 空工作区应失败 ───
+
+test_push_empty_fails() {
+    echo "=== 场景 14: Push 空工作区应失败 ==="
+    setup
+
+    assert_ok "init" $BZ init
+    $BZ agent register worker --level 2 --zones A >/dev/null
+
+    # workspace 为空 → push 应失败
+    assert_fail "push empty workspace" $BZ push -m "empty" --agent worker
 
     teardown
 }
@@ -518,12 +588,15 @@ main() {
     test_agent_delegation
     test_elevation_flow
     test_import_export
-    test_commit_chain_and_trace
+    test_push_pull_cross_agent
+    test_zone_isolation
     test_audit_integrity
     test_cross_cmd_delegation
     test_cross_cmd_elevation
     test_cross_cmd_agent_persistence
     test_elevation_return
+    test_push_files_in_main_repo
+    test_push_empty_fails
 
     echo ""
     echo "========================================"

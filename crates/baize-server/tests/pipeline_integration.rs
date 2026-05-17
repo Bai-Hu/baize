@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use baize_core::cert::CertTool;
 use baize_core::scope::{ElevationMode, Level};
 use baize_server::Baize;
+use baize_server::pipeline::{AgentRegistry, ElevationManager};
 
 /// 1. 完整委托链：root → parent → child，验证证书链 + 身份追溯
 #[test]
@@ -98,14 +99,13 @@ fn test_revoke_cascading() {
     assert_eq!(chain[0].agent_id, "child");
 }
 
-/// 6. register → blob → commit 完整审计记录
+/// 6. register → blob 完整审计记录
 #[test]
 fn test_audit_trail() {
     let mut baize = Baize::init_in_memory().unwrap();
     baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
 
-    let blob = baize.storage.blob_write("task data", &HashMap::new()).unwrap();
-    baize.storage.commit_create(&[blob.hash.clone()], "first commit", None, None, &HashMap::new()).unwrap();
+    baize.storage.blob_write("task data", &HashMap::new()).unwrap();
 
     // 查询审计记录
     let mut audit_filter = HashMap::new();

@@ -26,18 +26,18 @@
 
 ### 三个原语
 
-1. **blob** — 内容寻址的原始文本（原子）
+1. **blob** — 鉴权凭证（记录操作）
    - SHA-256 hash 作为唯一标识
    - 不可变
-   - 天然去重
+   - 记录"谁在什么权限下做了什么操作"
 
-2. **commit** — 一组 blob 的快照 + 元数据（版本）
-   - 指向一组 blob hash
-   - 有序、有父子关系
-   - 支持分支和标签
+2. **commit** — Agent ↔ 主仓库的数据同步操作
+   - 白泽 commit = Agent 将 workspace 文件推送到主仓库工作区
+   - git commit = 主仓库更新 Git 版本历史，**需要用户审批**
+   - 主仓库是 Git 仓库，Git 原生提供版本历史、分支、标签、差异比较
 
 3. **labels** — 任意 key-value 元数据（扩展）
-   - 可挂在 blob 或 commit 上
+   - 挂在 blob 上
    - append-only（可追加，不可修改或删除）
    - 所有上层语义通过 labels 约定
 
@@ -55,30 +55,31 @@
 
 | Git | 白泽/泽图 | 说明 |
 |-----|-----------|------|
-| blob | blob | 内容寻址的原子数据 |
-| tree | (不需要) | prompt 没有目录结构 |
-| commit | commit | 快照 + 元数据 |
-| tag/branch | tag/branch | 指向 commit 的命名引用 |
+| blob | blob | Git 存文件内容，白泽存鉴权凭证 |
+| tree | (不需要) | Agent 间通讯没有目录结构 |
+| commit | 白泽 commit ≠ git commit | 白泽: Agent→主仓库推送; Git: 用户审批后版本固化 |
+| tag/branch | Git branch/tag | 主仓库 Git 原生提供，用户控制 |
 | - | labels | **Git 没有的** — 可扩展元数据层 |
-| push/pull | **元操作** | blob/write = push, blob/query = pull |
+| push/pull | **元操作** | Agent↔Agent: blob/write=query; Agent↔主仓库: 白泽 commit/pull |
 
 ## Push/Pull 的本质
 
 ### 关键洞察
 
-白泽管理的不是"一套代码"（Git 模型），而是**无数条独立的交互数据流**。
+Push/pull 传输的是 **blob-data 对**（blob 用于鉴权，data 是实际内容）。
 
-- Git: 所有人在同一份文件上协作编辑 → push/pull = 同步 + 合并
-- 白泽: 每个 Agent/Session 是独立的数据流 → push/pull = 写入 + 查询
+白泽有两条数据路线：
 
-Agent 之间的通讯、Agent 与仲裁器的交互，全部通过 blob 操作 + labels 路由完成：
+1. **Agent ↔ Agent**：通过 blob 操作 + labels 路由完成
+   - Agent push = blob/write（写入交互数据）
+   - 仲裁器 pull = blob/query（按 thread_id 聚合）
+   - 仲裁器 push = blob/write（下发任务/决策）
+   - Agent pull = blob/query（查询分配给自己的任务）
 
-```
-Agent push   = blob/write（写入交互数据）
-仲裁器 pull  = blob/query（按 thread_id 聚合）
-仲裁器 push  = blob/write（下发任务/决策）
-Agent pull   = blob/query（查询分配给自己的任务）
-```
+2. **Agent ↔ 主仓库**：通过白泽 commit 完成（Agent 推送 + 用户审批 git commit）
+   - Agent 白泽 commit = workspace → 主仓库工作区（blob 鉴权）
+   - 用户审批 → git commit（版本固化）
+   - Agent pull = Git 历史 → workspace（blob 鉴权）
 
 因此 **泽图 v0 协议已经是完整的**，不需要额外的同步协议。
 
@@ -111,11 +112,19 @@ Agent pull   = blob/query（查询分配给自己的任务）
 
 - 泽图 v0 协议规范已完成（`PROTOCOL_SPEC.md`）
 - 白泽 v0.1 参考实现完成（Rust，CLI + HTTP API）
-- Labels 系统尚未实现（是协议的核心扩展机制）
+- Labels 系统已实现（EAV 表 + append-only + 查询 API）
+- 主仓库 Git 化完成（自实现 commit/ref 已移除，改用 git2）
+- Push/Pull 架构重构完成（push 写入工作区，pull 从工作区同步）
+- Agent 证书链 + 身份追溯已完成
+- Zone/Level 权限模型已完成
+- 借权（Elevation）申请/审批/归还已完成
+- 审计系统已完成（所有写操作自动生成审计 blob）
+- HTTP API 客户端中间件已完成（`baize-middleware` crate）
 
 ## 下一步
 
-1. 实现 labels 系统（EAV 表 + append-only + 查询 API）
-2. 基于泽图协议规范重构现有实现，使其符合 v0 协议
-3. 撰写多语言客户端集成指南
-4. Agent 框架集成标准定义
+1. 请求签名 + 证书认证（v1 P0 — 当前仅有 `x-agent-id` 明文标识）
+2. 审计哈希链（v1 P0 — 防篡改审计记录）
+3. 密钥加密存储（v1 P0 — 私钥安全）
+4. 撰写多语言客户端集成指南
+5. Agent 框架集成标准定义

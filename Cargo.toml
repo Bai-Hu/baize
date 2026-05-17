@@ -3,6 +3,7 @@ members = [
     "crates/baize-core",
     "crates/baize-server",
     "crates/baize-cli",
+    "crates/baize-middleware",
 ]
 resolver = "2"
 
@@ -41,6 +42,9 @@ anyhow = "1"
 
 # 时间
 chrono = "0.4"
+
+# Git
+git2 = "0.20"
 
 # 测试
 tempfile = "3"
