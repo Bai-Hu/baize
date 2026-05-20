@@ -6,6 +6,47 @@ use asn1_rs::Oid;
 
 // ─── 数据类型 ───
 
+/// 凭证生命周期状态（IDN-LCM）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialStatus {
+    Active,
+    Suspended,
+    Revoked,
+    Expired,
+}
+
+impl Default for CredentialStatus {
+    fn default() -> Self {
+        CredentialStatus::Active
+    }
+}
+
+impl std::fmt::Display for CredentialStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialStatus::Active => write!(f, "active"),
+            CredentialStatus::Suspended => write!(f, "suspended"),
+            CredentialStatus::Revoked => write!(f, "revoked"),
+            CredentialStatus::Expired => write!(f, "expired"),
+        }
+    }
+}
+
+impl std::str::FromStr for CredentialStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(CredentialStatus::Active),
+            "suspended" => Ok(CredentialStatus::Suspended),
+            "revoked" => Ok(CredentialStatus::Revoked),
+            "expired" => Ok(CredentialStatus::Expired),
+            _ => Err(format!("invalid credential status: '{}'", s)),
+        }
+    }
+}
+
 /// 证书身份信息（存储在证书的自定义扩展中）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertIdentity {
@@ -13,6 +54,9 @@ pub struct CertIdentity {
     pub parent_id: Option<String>,
     pub level: u8,
     pub zones: Vec<String>,
+    /// 凭证生命周期状态（v1 新增，向后兼容：默认 Active）
+    #[serde(default)]
+    pub status: CredentialStatus,
 }
 
 /// 签发结果：证书 PEM + 私钥 PEM + 身份信息（用于持久化）
@@ -53,6 +97,7 @@ impl CertTool {
             parent_id: None,
             level: 4,
             zones: vec!["*".to_string()],
+            status: CredentialStatus::Active,
         };
         let identity_json = serde_json::to_string(&identity)
             .map_err(|e| Error::Certificate(format!("serialize identity: {}", e)))?;
@@ -97,6 +142,7 @@ impl CertTool {
             parent_id: parent_id.map(String::from),
             level: scope.level.0,
             zones: scope.zones.iter().cloned().collect(),
+            status: CredentialStatus::Active,
         };
         let identity_json = serde_json::to_string(&identity)
             .map_err(|e| Error::Certificate(format!("serialize identity: {}", e)))?;
@@ -247,6 +293,13 @@ impl CertTool {
         }
 
         Ok(())
+    }
+
+    /// 生成独立的密钥对 PEM（用于 INF-KMS 多用途密钥）
+    pub fn generate_key_pair() -> Result<String> {
+        let key = KeyPair::generate()
+            .map_err(|e| Error::Certificate(format!("generate key pair: {}", e)))?;
+        Ok(key.serialize_pem())
     }
 
     /// 解析 PEM 为 DER 字节
@@ -530,5 +583,63 @@ mod tests {
 
         let result = CertTool::parse_identity(&pem);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn credential_status_default_is_active() {
+        let status: CredentialStatus = Default::default();
+        assert_eq!(status, CredentialStatus::Active);
+    }
+
+    #[test]
+    fn credential_status_display() {
+        assert_eq!(format!("{}", CredentialStatus::Active), "active");
+        assert_eq!(format!("{}", CredentialStatus::Suspended), "suspended");
+        assert_eq!(format!("{}", CredentialStatus::Revoked), "revoked");
+        assert_eq!(format!("{}", CredentialStatus::Expired), "expired");
+    }
+
+    #[test]
+    fn credential_status_serde_roundtrip() {
+        for status in [
+            CredentialStatus::Active,
+            CredentialStatus::Suspended,
+            CredentialStatus::Revoked,
+            CredentialStatus::Expired,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: CredentialStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, back);
+        }
+    }
+
+    #[test]
+    fn cert_identity_backward_compatible_deserialize() {
+        // v0 JSON 没有 status 字段，反序列化时默认为 Active
+        let v0_json = r#"{"agent_id":"agent-1","parent_id":"baize-root","level":2,"zones":["A"]}"#;
+        let identity: CertIdentity = serde_json::from_str(v0_json).unwrap();
+        assert_eq!(identity.agent_id, "agent-1");
+        assert_eq!(identity.status, CredentialStatus::Active);
+    }
+
+    #[test]
+    fn cert_identity_with_status_serialize() {
+        let identity = CertIdentity {
+            agent_id: "agent-1".into(),
+            parent_id: Some("baize-root".into()),
+            level: 2,
+            zones: vec!["A".into()],
+            status: CredentialStatus::Suspended,
+        };
+        let json = serde_json::to_string(&identity).unwrap();
+        assert!(json.contains("suspended"));
+        let back: CertIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, CredentialStatus::Suspended);
+    }
+
+    #[test]
+    fn root_ca_has_active_status() {
+        let (root, _) = CertTool::generate_root_ca().unwrap();
+        assert_eq!(root.identity.status, CredentialStatus::Active);
     }
 }

@@ -4,9 +4,11 @@ use tokio::sync::Mutex;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{request::Parts, StatusCode},
+    http::{request::Parts, StatusCode, Request},
     routing::{get, post, put, delete},
     response::IntoResponse,
+    body::Body,
+    middleware::{self, Next},
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +16,8 @@ use crate::pipeline::{
     Baize,
     AgentRegistry, ElevationManager, DataOps, FileSync, GitOps,
 };
+use crate::pipeline::auditor::Auditor;
+use baize_core::labels::*;
 use baize_core::scope::{ElevationMode, Level};
 
 // ─── 错误辅助 ───
@@ -24,6 +28,13 @@ fn error_response(status: StatusCode, error_type: &str) -> axum::response::Respo
         status,
         Json(serde_json::json!({"error": error_type})),
     ).into_response()
+}
+
+/// 从 label map 取值，缺失时返回 JSON null（而非占位符字符串）
+fn label_val(labels: &std::collections::HashMap<String, String>, key: &str) -> serde_json::Value {
+    labels.get(key)
+        .map(|v| serde_json::Value::String(v.clone()))
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// 根据 Error 类型返回合适的 HTTP 状态码 + 安全消息
@@ -37,6 +48,14 @@ fn map_error(e: baize_core::Error) -> axum::response::Response {
         baize_core::Error::Certificate(_) => (StatusCode::BAD_REQUEST, "certificate error"),
         baize_core::Error::Storage(..) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
         baize_core::Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+        baize_core::Error::ChannelClosed(_) => (StatusCode::GONE, "channel closed"),
+        baize_core::Error::ConstraintViolation(_) => (StatusCode::BAD_REQUEST, "constraint violation"),
+        baize_core::Error::ChainBroken(_) => (StatusCode::BAD_REQUEST, "chain broken"),
+        baize_core::Error::SignatureInvalid(_) => (StatusCode::UNAUTHORIZED, "authentication failed"),
+        baize_core::Error::ExpiredTimestamp(_) => (StatusCode::UNAUTHORIZED, "authentication failed"),
+        baize_core::Error::CredentialExpired(_) => (StatusCode::GONE, "credential expired"),
+        baize_core::Error::IntentExpired(_) => (StatusCode::GONE, "intent expired"),
+        baize_core::Error::AuthorizationExpired(_) => (StatusCode::GONE, "authorization expired"),
     };
     error_response(status, msg)
 }
@@ -61,48 +80,199 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for AgentId {
 
 pub type AppState = Arc<Mutex<Baize>>;
 
+// ─── v1 签名验证 middleware ───
+
+/// v1 请求签名验证 middleware
+///
+/// - 有 x-signature + x-timestamp 头时：验证 HMAC-SHA256 签名
+/// - 无签名头时：直接放行（fallback 到纯 x-agent-id，过渡期）
+async fn v1_signature_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let headers = req.headers();
+    let has_sig = headers.get("x-signature").is_some() && headers.get("x-timestamp").is_some();
+
+    if !has_sig {
+        // 无签名头 → 放行（fallback 到纯 x-agent-id）
+        return next.run(req).await;
+    }
+
+    // 提取签名相关头
+    let agent_id = match headers.get("x-agent-id").and_then(|v| v.to_str().ok()) {
+        Some(id) => id.to_string(),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing x-agent-id header"),
+    };
+    let timestamp = match headers.get("x-timestamp").and_then(|v| v.to_str().ok()) {
+        Some(ts) => ts.to_string(),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing x-timestamp header"),
+    };
+    let signature = match headers.get("x-signature").and_then(|v| v.to_str().ok()) {
+        Some(sig) => sig.to_string(),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing x-signature header"),
+    };
+
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+
+    // 消费 body 用于签名验证
+    let (parts, body) = req.into_parts();
+    let body_bytes = match http_body_util::BodyExt::collect(body).await {
+        Ok(collected) => collected.to_bytes().to_vec(),
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "failed to read request body"),
+    };
+    let body_str = String::from_utf8_lossy(&body_bytes).to_string();
+
+    // 获取 agent 签名密钥
+    let baize = state.lock().await;
+    match get_agent_signing_key(&baize, &agent_id) {
+        Ok(key) => {
+            // 验证签名
+            if let Err(e) = crate::pipeline::auth::verify_signature(
+                &key, &timestamp, &method, &path, &body_str, &signature,
+            ) {
+                return map_error(e);
+            }
+        }
+        Err(_) => {
+            // 密钥未找到 → 有签名头但无法验证，拒绝请求
+            return error_response(StatusCode::UNAUTHORIZED, "no signing key found for agent");
+        }
+    }
+    drop(baize);
+
+    // 重建请求
+    let new_req = Request::from_parts(parts, Body::from(body_bytes));
+    next.run(new_req).await
+}
+
+/// 获取 agent 的签名密钥
+///
+/// 查找 IDN_SIGN 用途的 agent-key blob，解密后提取 HMAC 密钥。
+/// 若无专用密钥，回退到 agent-id 索引的通用密钥（root agent 兼容）。
+fn get_agent_signing_key(baize: &Baize, agent_id: &str) -> Result<Vec<u8>, String> {
+    // 优先查找 IDN_SIGN 用途密钥
+    let mut filter = std::collections::HashMap::new();
+    filter.insert("type".to_string(), "agent-key".to_string());
+    filter.insert(LABEL_KEY_OWNER.to_string(), agent_id.to_string());
+    filter.insert(LABEL_KEY_PURPOSE.to_string(), "IDN_SIGN".to_string());
+
+    let keys = baize.storage.blob_query(&filter).unwrap_or_default();
+
+    let key_content = if let Some(blob) = keys.first() {
+        blob.content.clone()
+    } else {
+        // 回退：查找 agent-id 索引的 IDN_SIGN 密钥（root agent）
+        let mut fallback = std::collections::HashMap::new();
+        fallback.insert("type".to_string(), "agent-key".to_string());
+        fallback.insert("agent-id".to_string(), agent_id.to_string());
+        fallback.insert(LABEL_KEY_PURPOSE.to_string(), "IDN_SIGN".to_string());
+        let fallback_keys = baize.storage.blob_query(&fallback).unwrap_or_default();
+        match fallback_keys.first() {
+            Some(blob) => blob.content.clone(),
+            None => return Err(format!("no signing key for agent {}", agent_id)),
+        }
+    };
+
+    // 尝试解密（如果有 master secret）
+    let pem = if let Some(secret) = baize_core::crypto::master_secret_from_env() {
+        baize_core::crypto::decrypt_key(&key_content, &secret)
+            .map_err(|e| format!("key decryption failed: {}", e))?
+    } else {
+        // 无 master secret → 明文存储
+        key_content
+    };
+
+    Ok(crate::pipeline::auth::extract_signing_key(&pem))
+}
+
 pub fn app(baize: Baize) -> Router {
     let state = Arc::new(Mutex::new(baize));
     Router::new()
-        // Agent 管理
+        // ─── v0 路由（保持不变）───
         .route("/api/v0/agents", post(register_agent))
         .route("/api/v0/agents", get(list_agents))
         .route("/api/v0/agents/{id}", delete(revoke_agent))
-        // Blob 操作
         .route("/api/v0/blobs", post(blob_write))
         .route("/api/v0/blobs/{hash}", get(blob_read))
         .route("/api/v0/blobs/query", post(blob_query))
-        // Git log
         .route("/api/v0/log", get(git_log_handler))
-        // Label 操作
         .route("/api/v0/labels", post(label_add))
         .route("/api/v0/labels/query", get(label_query))
-        // Git refs
         .route("/api/v0/refs", get(git_ref_list_handler))
         .route("/api/v0/refs/{name}", get(git_ref_get_handler))
         .route("/api/v0/refs/{name}", put(git_ref_set_handler))
         .route("/api/v0/refs/{name}", delete(git_ref_delete_handler))
-        // Elevation
         .route("/api/v0/elevation", post(elevation_request))
         .route("/api/v0/elevation/{id}/approve", post(elevation_approve))
         .route("/api/v0/elevation", get(elevation_list))
-        // Trace
         .route("/api/v0/trace/identity/{id}", get(trace_identity))
-        // Import/Export
         .route("/api/v0/import", post(import_data))
         .route("/api/v0/export/{hash}", get(export_data))
         .route("/api/v0/audit", get(audit_query))
         .route("/api/v0/elevation/{id}/return", post(elevation_return))
-        // File 操作（网关代理）
         .route("/api/v0/files/{*path}", post(file_write))
         .route("/api/v0/files/{*path}", get(file_read))
         .route("/api/v0/files/{*path}", delete(file_delete))
         .route("/api/v0/files", get(file_list))
-        // Push / Pull
         .route("/api/v0/push", post(push))
         .route("/api/v0/pull", post(pull))
-        // Repo
         .route("/api/v0/repo/stats", get(repo_stats_handler))
+
+        // ─── v1 路由（v0 全部端点 + v1 新增）───
+        // v0 兼容端点
+        .route("/api/v1/agents", post(register_agent))
+        .route("/api/v1/agents", get(list_agents))
+        .route("/api/v1/agents/{id}", delete(revoke_agent))
+        .route("/api/v1/blobs", post(blob_write))
+        .route("/api/v1/blobs/{hash}", get(blob_read))
+        .route("/api/v1/blobs/query", post(blob_query))
+        .route("/api/v1/log", get(git_log_handler))
+        .route("/api/v1/labels", post(label_add))
+        .route("/api/v1/labels/query", get(label_query))
+        .route("/api/v1/refs", get(git_ref_list_handler))
+        .route("/api/v1/refs/{name}", get(git_ref_get_handler))
+        .route("/api/v1/refs/{name}", put(git_ref_set_handler))
+        .route("/api/v1/refs/{name}", delete(git_ref_delete_handler))
+        .route("/api/v1/elevation", post(elevation_request))
+        .route("/api/v1/elevation/{id}/approve", post(elevation_approve))
+        .route("/api/v1/elevation", get(elevation_list))
+        .route("/api/v1/trace/identity/{id}", get(trace_identity))
+        .route("/api/v1/import", post(import_data))
+        .route("/api/v1/export/{hash}", get(export_data))
+        .route("/api/v1/files/{*path}", post(file_write))
+        .route("/api/v1/files/{*path}", get(file_read))
+        .route("/api/v1/files/{*path}", delete(file_delete))
+        .route("/api/v1/files", get(file_list))
+        .route("/api/v1/push", post(push))
+        .route("/api/v1/pull", post(pull))
+        .route("/api/v1/repo/stats", get(repo_stats_handler))
+
+        // v1 新增端点
+        .route("/api/v1/intents", post(v1_intent_create))
+        .route("/api/v1/intents/derive", post(v1_intent_derive))
+        .route("/api/v1/intents/{hash}", get(v1_intent_read))
+        .route("/api/v1/intents", get(v1_intent_query))
+        .route("/api/v1/receipts", post(v1_receipt_create))
+        .route("/api/v1/receipts/{hash}", get(v1_receipt_read))
+        .route("/api/v1/receipts", get(v1_receipt_query))
+        .route("/api/v1/authorizations", post(v1_authorization_create))
+        .route("/api/v1/authorizations/delegate", post(v1_authorization_delegate))
+        .route("/api/v1/authorizations/{hash}/verify", post(v1_authorization_verify))
+        .route("/api/v1/authorizations/{hash}", get(v1_authorization_read))
+        .route("/api/v1/sessions", post(v1_session_create))
+        .route("/api/v1/sessions/{id}", get(v1_session_read))
+        .route("/api/v1/sessions/{id}/close", post(v1_session_close))
+        .route("/api/v1/cnv/verify", post(v1_cnv_verify))
+        .route("/api/v1/audit", get(v1_audit_query))
+        .route("/api/v1/audit/verify-chain", post(v1_audit_verify_chain))
+        .route("/api/v1/agents/{id}/status", get(v1_agent_status))
+        .route("/api/v1/agents/{id}/status", put(v1_agent_update_status))
+        .route("/api/v1/agents/{id}/proof", post(v1_agent_proof))
+
+        // v1 签名验证 middleware（仅对 /api/v1 生效）
+        .layer(middleware::from_fn_with_state(state.clone(), v1_signature_middleware))
         .with_state(state)
 }
 
@@ -206,7 +376,95 @@ struct PullRequest {
     r#ref: Option<String>,
 }
 
-// ─── Handler ───
+// ─── v1 新增 DTO ───
+
+#[derive(Deserialize)]
+struct V1IntentCreateRequest {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct V1IntentDeriveRequest {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct V1ReceiptCreateRequest {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct V1AuthorizationCreateRequest {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct V1AuthorizationDelegateRequest {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct V1AuthorizationVerifyRequest {
+    action_type: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    target: Option<serde_json::Value>,
+    #[serde(default)]
+    amount: Option<f64>,
+    #[serde(default)]
+    environment: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct V1SessionCreateRequest {
+    session_id: String,
+    peer_a: String,
+    peer_b: String,
+    #[serde(default)]
+    ephemeral_pub: String,
+    #[serde(default)]
+    cipher_suites: Vec<String>,
+    #[serde(default)]
+    credential_digest_a: String,
+    #[serde(default)]
+    credential_digest_b: String,
+    #[serde(default)]
+    handshake_transcript_digest: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct V1SessionCloseRequest {
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct V1CnvVerifyRequest {
+    receipt_digest: String,
+}
+
+#[derive(Deserialize)]
+struct V1AgentUpdateStatusRequest {
+    status: String,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct V1AgentProofRequest {
+    #[serde(default)]
+    instance_state_attributes: Option<serde_json::Value>,
+    #[serde(default = "default_proof_anchor")]
+    proof_anchor_mode: String,
+}
+
+fn default_proof_anchor() -> String {
+    "CREDENTIAL_ANCHORED".to_string()
+}
+
+// ─── v0 Handler ───
 
 async fn register_agent(
     State(state): State<AppState>,
@@ -541,7 +799,7 @@ async fn elevation_return(
     }
 }
 
-// ─── 审计查询 ───
+// ─── v0 审计查询 ───
 
 async fn audit_query(
     State(state): State<AppState>,
@@ -560,11 +818,11 @@ async fn audit_query(
         Ok(records) => Json(serde_json::json!({
             "records": records.iter().map(|(hash, labels)| serde_json::json!({
                 "hash": hash,
-                "type": labels.get("x-audit-type").unwrap_or(&"-".to_string()),
-                "agent": labels.get("x-audit-agent").unwrap_or(&"-".to_string()),
-                "result": labels.get("x-audit-result").unwrap_or(&"-".to_string()),
-                "target": labels.get("x-audit-target").unwrap_or(&"-".to_string()),
-                "time": labels.get("x-audit-time").unwrap_or(&"-".to_string()),
+                "type": label_val(labels, "x-audit-type"),
+                "agent": label_val(labels, "x-audit-agent"),
+                "result": label_val(labels, "x-audit-result"),
+                "target": label_val(labels, "x-audit-target"),
+                "time": label_val(labels, "x-audit-time"),
             })).collect::<Vec<_>>()
         })).into_response(),
         Err(e) => map_error(e),
@@ -673,6 +931,595 @@ async fn repo_stats_handler(State(state): State<AppState>) -> impl IntoResponse 
             "total_commits": stats.total_commits,
             "total_refs": stats.total_refs,
         })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// ─── v1 新增 Handler ───
+
+// INT：意图创建（通过 blob write，从 content 解析完整 labels）
+async fn v1_intent_create(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Json(req): Json<V1IntentCreateRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    // 从 content JSON 解析 payload，用 adapter 生成完整 labels
+    let payload = match baize_asl::AslAdapter::intent_from_blob(&req.content) {
+        Ok(p) => p,
+        Err(e) => return map_error(e),
+    };
+    let labels = baize_asl::AslAdapter::intent_to_labels(&payload);
+    match baize.pipe_blob_write(&agent.0, &req.content, &labels) {
+        Ok(blob) => (StatusCode::CREATED, Json(serde_json::json!({
+            "hash": blob.hash,
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// INT：子意图派生（通过 blob write，从 content 解析完整 labels）
+async fn v1_intent_derive(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Json(req): Json<V1IntentDeriveRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let payload = match baize_asl::AslAdapter::sub_intent_from_blob(&req.content) {
+        Ok(p) => p,
+        Err(e) => return map_error(e),
+    };
+    let labels = baize_asl::AslAdapter::sub_intent_to_labels(&payload);
+    match baize.pipe_blob_write(&agent.0, &req.content, &labels) {
+        Ok(blob) => (StatusCode::CREATED, Json(serde_json::json!({
+            "hash": blob.hash,
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// INT：读取意图
+async fn v1_intent_read(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.storage.blob_read(&hash) {
+        Ok(blob) => {
+            let blob_type = blob.labels.get("type").unwrap_or(&"-".to_string()).clone();
+            if blob_type != BLOB_TYPE_INTENT && blob_type != BLOB_TYPE_SUB_INTENT {
+                return error_response(StatusCode::NOT_FOUND, "not an intent blob");
+            }
+            Json(serde_json::json!({
+                "hash": blob.hash,
+                "content": blob.content,
+                "labels": blob.labels,
+                "created_at": blob.created_at,
+            })).into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// INT：查询意图
+async fn v1_intent_query(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let mut filter = std::collections::HashMap::new();
+    filter.insert("type".to_string(), BLOB_TYPE_INTENT.to_string());
+    if let Some(status) = params.get("status") {
+        filter.insert(LABEL_INTENT_STATUS.to_string(), status.clone());
+    }
+    if let Some(owner) = params.get("owner") {
+        filter.insert(LABEL_INTENT_OWNER.to_string(), owner.clone());
+    }
+    match baize.storage.blob_query_metadata(&filter) {
+        Ok(records) => Json(serde_json::json!({
+            "intents": records.iter().map(|(hash, labels)| serde_json::json!({
+                "hash": hash,
+                "intent_id": label_val(labels, LABEL_INTENT_ID),
+                "owner": label_val(labels, LABEL_INTENT_OWNER),
+                "status": label_val(labels, LABEL_INTENT_STATUS),
+                "expires": label_val(labels, LABEL_INTENT_EXPIRES),
+            })).collect::<Vec<_>>()
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// INT：创建回执（从 content 解析完整 labels）
+async fn v1_receipt_create(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Json(req): Json<V1ReceiptCreateRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let payload = match baize_asl::AslAdapter::receipt_from_blob(&req.content) {
+        Ok(p) => p,
+        Err(e) => return map_error(e),
+    };
+    let labels = baize_asl::AslAdapter::receipt_to_labels(&payload);
+    match baize.pipe_blob_write(&agent.0, &req.content, &labels) {
+        Ok(blob) => (StatusCode::CREATED, Json(serde_json::json!({
+            "hash": blob.hash,
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// INT：读取回执
+async fn v1_receipt_read(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.storage.blob_read(&hash) {
+        Ok(blob) => {
+            let blob_type = blob.labels.get("type").unwrap_or(&"-".to_string()).clone();
+            if blob_type != BLOB_TYPE_RECEIPT {
+                return error_response(StatusCode::NOT_FOUND, "not a receipt blob");
+            }
+            Json(serde_json::json!({
+                "hash": blob.hash,
+                "content": blob.content,
+                "labels": blob.labels,
+                "created_at": blob.created_at,
+            })).into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// INT：查询回执
+async fn v1_receipt_query(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let mut filter = std::collections::HashMap::new();
+    filter.insert("type".to_string(), BLOB_TYPE_RECEIPT.to_string());
+    if let Some(executor) = params.get("executor") {
+        filter.insert(LABEL_RECEIPT_EXECUTOR.to_string(), executor.clone());
+    }
+    if let Some(status) = params.get("status") {
+        filter.insert(LABEL_RECEIPT_STATUS.to_string(), status.clone());
+    }
+    match baize.storage.blob_query_metadata(&filter) {
+        Ok(records) => Json(serde_json::json!({
+            "receipts": records.iter().map(|(hash, labels)| serde_json::json!({
+                "hash": hash,
+                "receipt_id": label_val(labels, LABEL_RECEIPT_ID),
+                "executor": label_val(labels, LABEL_RECEIPT_EXECUTOR),
+                "status": label_val(labels, LABEL_RECEIPT_STATUS),
+            })).collect::<Vec<_>>()
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// AZN：创建授权（从 content 解析完整 labels）
+async fn v1_authorization_create(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Json(req): Json<V1AuthorizationCreateRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let payload = match baize_asl::AslAdapter::authorization_from_blob(&req.content) {
+        Ok(p) => p,
+        Err(e) => return map_error(e),
+    };
+    let labels = baize_asl::AslAdapter::authorization_to_labels(&payload);
+    match baize.pipe_blob_write(&agent.0, &req.content, &labels) {
+        Ok(blob) => (StatusCode::CREATED, Json(serde_json::json!({
+            "hash": blob.hash,
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// AZN：委托子授权（从 content 解析完整 labels）
+async fn v1_authorization_delegate(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Json(req): Json<V1AuthorizationDelegateRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let payload = match baize_asl::AslAdapter::authorization_from_blob(&req.content) {
+        Ok(p) => p,
+        Err(e) => return map_error(e),
+    };
+    let labels = baize_asl::AslAdapter::authorization_to_labels(&payload);
+    match baize.pipe_blob_write(&agent.0, &req.content, &labels) {
+        Ok(blob) => (StatusCode::CREATED, Json(serde_json::json!({
+            "hash": blob.hash,
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// AZN：校验授权（AZN-VER）
+async fn v1_authorization_verify(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+    Json(req): Json<V1AuthorizationVerifyRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let exec_ctx = baize_asl::verify::ExecutionContext {
+        subject: req.subject,
+        target: req.target,
+        amount: req.amount,
+        environment: req.environment,
+    };
+    match baize_asl::verify::verify_authorization(&baize.storage, &hash, &req.action_type, &exec_ctx) {
+        Ok(result) => {
+            let checks_map: std::collections::BTreeMap<&str, bool> = [
+                ("credential_authenticity", result.checks[0]),
+                ("credential_validity", result.checks[1]),
+                ("intent_reference", result.checks[2]),
+                ("delegation_chain", result.checks[3]),
+                ("execution_applicability", result.checks[4]),
+            ].into_iter().collect();
+            Json(serde_json::json!({
+                "valid": result.valid,
+                "checks": checks_map,
+                "errors": result.errors,
+            })).into_response()
+        }
+        Err(e) => map_error(e),
+    }
+}
+
+// AZN：读取授权
+async fn v1_authorization_read(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.storage.blob_read(&hash) {
+        Ok(blob) => {
+            let blob_type = blob.labels.get("type").unwrap_or(&"-".to_string()).clone();
+            if blob_type != BLOB_TYPE_AUTHORIZATION {
+                return error_response(StatusCode::NOT_FOUND, "not an authorization blob");
+            }
+            Json(serde_json::json!({
+                "hash": blob.hash,
+                "content": blob.content,
+                "labels": blob.labels,
+                "created_at": blob.created_at,
+            })).into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// LNK：创建会话（session-init blob）
+async fn v1_session_create(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Json(req): Json<V1SessionCreateRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let now = chrono::Utc::now();
+    let expires_at = req.expires_at.unwrap_or_else(|| {
+        (now + chrono::Duration::minutes(30)).to_rfc3339()
+    });
+    let content = serde_json::json!({
+        "session_id": req.session_id,
+        "peer_a": req.peer_a,
+        "peer_b": req.peer_b,
+        "credential_hash_a": req.credential_digest_a,
+        "credential_hash_b": req.credential_digest_b,
+        "handshake_transcript_hash": req.handshake_transcript_digest,
+        "ephemeral_pub": req.ephemeral_pub,
+        "cipher_suites": req.cipher_suites,
+        "established_at": now.to_rfc3339(),
+        "expires_at": expires_at,
+    }).to_string();
+    let labels = std::collections::HashMap::from([
+        ("type".to_string(), "session-init".to_string()),
+        (LABEL_SESSION_ID.to_string(), req.session_id.clone()),
+        (LABEL_SESSION_PEER_A.to_string(), req.peer_a.clone()),
+        (LABEL_SESSION_PEER_B.to_string(), req.peer_b.clone()),
+        (LABEL_SESSION_STATUS.to_string(), "active".to_string()),
+    ]);
+    match baize.pipe_blob_write(&agent.0, &content, &labels) {
+        Ok(blob) => (StatusCode::CREATED, Json(serde_json::json!({
+            "hash": blob.hash,
+            "session_id": req.session_id,
+            "peer_a": req.peer_a,
+            "peer_b": req.peer_b,
+            "status": "active",
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// LNK：读取会话
+async fn v1_session_read(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let mut filter = std::collections::HashMap::new();
+    filter.insert("type".to_string(), "session-init".to_string());
+    filter.insert(LABEL_SESSION_ID.to_string(), id.clone());
+    match baize.storage.blob_query(&filter) {
+        Ok(blobs) => {
+            if let Some(blob) = blobs.first() {
+                Json(serde_json::json!({
+                    "session_id": id,
+                    "content": blob.content,
+                    "labels": blob.labels,
+                    "created_at": blob.created_at,
+                })).into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// LNK：关闭 session
+async fn v1_session_close(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Path(id): Path<String>,
+    Json(req): Json<V1SessionCloseRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+
+    // 验证 session 存在且未关闭
+    let mut session_filter = std::collections::HashMap::new();
+    session_filter.insert("type".to_string(), "session-init".to_string());
+    session_filter.insert(LABEL_SESSION_ID.to_string(), id.clone());
+    match baize.storage.blob_query(&session_filter) {
+        Ok(blobs) if !blobs.is_empty() => {
+            // 检查是否已关闭
+            let close_filter = vec![
+                ("type".to_string(), "session-close".to_string()),
+                (LABEL_SESSION_ID.to_string(), id.clone()),
+            ];
+            let close_map: std::collections::HashMap<String, String> = close_filter.into_iter().collect();
+            if let Ok(close_blobs) = baize.storage.blob_query(&close_map) {
+                if !close_blobs.is_empty() {
+                    return error_response(StatusCode::CONFLICT, "session already closed");
+                }
+            }
+        }
+        _ => return error_response(StatusCode::NOT_FOUND, "session not found"),
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let reason = req.reason.unwrap_or_default();
+
+    // 计算最终会话摘要：session_id + closed_by + timestamp
+    let final_input = format!("{}:{}:{}", id, agent.0, now);
+    let final_hash = format!("sha256:{}", {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(final_input.as_bytes());
+        hex::encode(hasher.finalize())
+    });
+
+    let content = serde_json::json!({
+        "session_id": id,
+        "action": "close",
+        "closed_by": agent.0,
+        "reason": reason,
+        "final_hash": final_hash,
+    }).to_string();
+    let mut labels = std::collections::HashMap::from([
+        ("type".to_string(), "session-close".to_string()),
+        (LABEL_SESSION_ID.to_string(), id.clone()),
+        (LABEL_SESSION_STATUS.to_string(), "closed".to_string()),
+        (LABEL_SESSION_CLOSED_AT.to_string(), now),
+        (LABEL_SESSION_FINAL_HASH.to_string(), final_hash),
+    ]);
+    if !reason.is_empty() {
+        labels.insert(LABEL_SESSION_CLOSE_REASON.to_string(), reason);
+    }
+    match baize.pipe_blob_write(&agent.0, &content, &labels) {
+        Ok(blob) => (StatusCode::CREATED, Json(serde_json::json!({
+            "hash": blob.hash,
+            "session_id": id,
+            "status": "closed",
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// INT：CNV 全链路校验
+async fn v1_cnv_verify(
+    State(state): State<AppState>,
+    Json(req): Json<V1CnvVerifyRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize_asl::verify::cnv_verify(&baize.storage, &req.receipt_digest) {
+        Ok(result) => {
+            let intent_chain: Vec<serde_json::Value> = result.intent_chain.iter().map(|node| {
+                serde_json::json!({
+                    "hash": node.digest,
+                    "intent_id": node.intent_id,
+                    "depth": node.depth,
+                    "valid": true,
+                })
+            }).collect();
+            let authorization_chain = serde_json::json!([{
+                "authz_found": result.authz_checks.authz_found,
+                "issuer_valid": result.authz_checks.issuer_valid,
+                "source_intent_match": result.authz_checks.source_intent_match,
+                "delegation_chain_valid": result.authz_checks.delegation_chain_valid,
+            }]);
+            Json(serde_json::json!({
+                "valid": result.valid,
+                "intent_chain": intent_chain,
+                "authorization_chain": authorization_chain,
+                "errors": result.errors,
+            })).into_response()
+        }
+        Err(e) => map_error(e),
+    }
+}
+
+// AUDIT：v1 审计查询（含链信息）
+async fn v1_audit_query(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let mut filter = std::collections::HashMap::new();
+    filter.insert("x-audit".to_string(), "true".to_string());
+    if let Some(agent) = params.get("agent") {
+        filter.insert("x-audit-agent".to_string(), agent.clone());
+    }
+    if let Some(audit_type) = params.get("type") {
+        filter.insert("x-audit-type".to_string(), audit_type.clone());
+    }
+    match baize.storage.blob_query_metadata(&filter) {
+        Ok(records) => Json(serde_json::json!({
+            "records": records.iter().map(|(hash, labels)| serde_json::json!({
+                "hash": hash,
+                "type": label_val(labels, "x-audit-type"),
+                "agent": label_val(labels, "x-audit-agent"),
+                "result": label_val(labels, "x-audit-result"),
+                "target": label_val(labels, "x-audit-target"),
+                "time": label_val(labels, "x-audit-time"),
+                "chain_index": label_val(labels, LABEL_AUDIT_CHAIN_INDEX),
+                "prev": label_val(labels, LABEL_AUDIT_PREV),
+            })).collect::<Vec<_>>()
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// AUDIT：审计链验证
+async fn v1_audit_verify_chain(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.verify_chain() {
+        Ok(result) => Json(serde_json::json!({
+            "valid": result.valid,
+            "chain_length": result.chain_length,
+            "head_digest": result.head_digest,
+            "genesis_digest": result.genesis_digest,
+            "errors": result.errors,
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// IDN：查询凭证状态
+async fn v1_agent_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.credential_status(&id) {
+        Ok(status) => Json(serde_json::json!({
+            "agent_id": id,
+            "status": status.to_string(),
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// IDN：更新凭证状态
+async fn v1_agent_update_status(
+    State(state): State<AppState>,
+    _agent: AgentId,
+    Path(id): Path<String>,
+    Json(req): Json<V1AgentUpdateStatusRequest>,
+) -> impl IntoResponse {
+    let mut baize = state.lock().await;
+    let status = match req.status.parse::<baize_core::cert::CredentialStatus>() {
+        Ok(s) => s,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("invalid status '{}', expected: active, suspended, revoked, expired", req.status)
+            }))).into_response();
+        }
+    };
+    match baize.update_credential_status(&id, status, &req.reason) {
+        Ok(()) => Json(serde_json::json!({
+            "agent_id": id,
+            "status": status.to_string(),
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// IDN：生成运行态证明
+async fn v1_agent_proof(
+    State(state): State<AppState>,
+    _agent: AgentId,
+    Path(id): Path<String>,
+    Json(req): Json<V1AgentProofRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    // 验证 agent 存在且凭证有效
+    if let Err(e) = baize.credential_status(&id) {
+        return map_error(e);
+    }
+
+    // 查找 agent-cert blob 获取 credential_digest
+    let mut cert_filter = std::collections::HashMap::new();
+    cert_filter.insert("type".to_string(), "agent-cert".to_string());
+    cert_filter.insert("agent-id".to_string(), id.clone());
+    let certs = baize.storage.blob_query(&cert_filter).unwrap_or_default();
+    let credential_digest = certs.first()
+        .map(|c| c.hash.clone())
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now();
+    let proof_id = format!("proof-{}-{}", id, now.timestamp_millis());
+    let expires = (now + chrono::Duration::minutes(5)).to_rfc3339();
+
+    let instance_attrs = req.instance_state_attributes
+        .unwrap_or(serde_json::json!({
+            "instance_id": id,
+            "instance_status": "running"
+        }));
+
+    // binding_context_digest: agent-cert hash + timestamp 的摘要
+    let binding_input = format!("{}:{}", credential_digest, now.to_rfc3339());
+    let binding_digest = format!("sha256:{}", {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(binding_input.as_bytes());
+        hex::encode(hasher.finalize())
+    });
+
+    let anchor_mode = match req.proof_anchor_mode.as_str() {
+        "ENVIRONMENT_ANCHORED" => baize_asl::payload::ProofAnchorMode::EnvironmentAnchored,
+        _ => baize_asl::payload::ProofAnchorMode::CredentialAnchored,
+    };
+
+    let proof = baize_asl::payload::RuntimeProofContent {
+        proof_id: proof_id.clone(),
+        credential_digest: credential_digest.clone(),
+        instance_state_attributes: instance_attrs,
+        binding_context_digest: binding_digest,
+        proof_anchor_mode: anchor_mode,
+        issued_at: now.to_rfc3339(),
+        expires_at: expires.clone(),
+    };
+    let content = serde_json::to_string(&proof).unwrap();
+
+    let labels = std::collections::HashMap::from([
+        ("type".to_string(), "runtime-proof".to_string()),
+        (LABEL_PROOF_AGENT.to_string(), id.clone()),
+        (LABEL_PROOF_CREDENTIAL.to_string(), credential_digest),
+    ]);
+    match baize.pipe_blob_write(&id, &content, &labels) {
+        Ok(blob) => (StatusCode::CREATED, Json(serde_json::json!({
+            "hash": blob.hash,
+            "proof_id": proof_id,
+            "expires_at": expires,
+        }))).into_response(),
         Err(e) => map_error(e),
     }
 }

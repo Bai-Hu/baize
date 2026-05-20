@@ -5,6 +5,7 @@ use baize_core::ROOT_AGENT_ID;
 use baize_server::pipeline::{
     AgentRegistry, ElevationManager, DataOps, FileSync, GitOps,
 };
+use baize_server::pipeline::auditor::Auditor;
 use baize_server::Baize;
 use clap::{Parser, Subcommand};
 
@@ -70,7 +71,10 @@ enum Commands {
     },
 
     /// 审计日志
-    Audit,
+    Audit {
+        #[command(subcommand)]
+        action: Option<AuditAction>,
+    },
 
     /// 仓库统计
     Stats,
@@ -124,6 +128,36 @@ enum Commands {
         agent: String,
     },
 
+    /// 意图操作 (v1)
+    Intent {
+        #[command(subcommand)]
+        action: IntentAction,
+    },
+
+    /// 回执操作 (v1)
+    Receipt {
+        #[command(subcommand)]
+        action: ReceiptAction,
+    },
+
+    /// 授权操作 (v1)
+    Authz {
+        #[command(subcommand)]
+        action: AuthzAction,
+    },
+
+    /// 会话操作 (v1)
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+
+    /// CNV 全链路校验 (v1)
+    Cnv {
+        #[command(subcommand)]
+        action: CnvAction,
+    },
+
     /// 启动 HTTP API 服务器
     Serve {
         /// 监听地址
@@ -168,6 +202,26 @@ enum AgentAction {
     },
     /// 列出所有 Agent
     List,
+    /// 查询凭证状态 (v1)
+    Status {
+        agent_id: String,
+    },
+    /// 暂停凭证 (v1)
+    Suspend {
+        agent_id: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// 恢复凭证 (v1)
+    Reactivate {
+        agent_id: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// 生成运行态证明 (v1)
+    Proof {
+        agent_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -262,6 +316,14 @@ enum ElevateAction {
 }
 
 #[derive(Subcommand)]
+enum AuditAction {
+    /// 查看审计日志（默认）
+    Log,
+    /// 验证审计哈希链 (v1)
+    ChainVerify,
+}
+
+#[derive(Subcommand)]
 enum FileAction {
     /// 写入文件
     Write {
@@ -290,6 +352,135 @@ enum FileAction {
     Ls {
         #[arg(long, default_value = ROOT_AGENT_ID)]
         agent: String,
+    },
+}
+
+// ─── v1 新增 CLI 子命令 ───
+
+#[derive(Subcommand)]
+enum IntentAction {
+    /// 创建通用意图
+    Create {
+        #[arg(long)]
+        content: String,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 派生子意图
+    Derive {
+        #[arg(long)]
+        content: String,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 读取意图
+    Read {
+        hash: String,
+    },
+    /// 查询意图
+    Query {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReceiptAction {
+    /// 创建执行回执
+    Create {
+        #[arg(long)]
+        content: String,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 读取回执
+    Read {
+        hash: String,
+    },
+    /// 查询回执
+    Query {
+        #[arg(long)]
+        executor: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthzAction {
+    /// 签发授权
+    Issue {
+        #[arg(long)]
+        content: String,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 委托子授权
+    Delegate {
+        #[arg(long)]
+        content: String,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 校验授权
+    Verify {
+        hash: String,
+        #[arg(long)]
+        action_type: String,
+    },
+    /// 读取授权
+    Read {
+        hash: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// 创建会话
+    Create {
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        peer_a: String,
+        #[arg(long)]
+        peer_b: String,
+        #[arg(long, default_value = "")]
+        ephemeral_pub: String,
+        #[arg(long, value_delimiter = ',', default_value = "AES-256-GCM")]
+        cipher_suites: Vec<String>,
+        #[arg(long, default_value = "")]
+        credential_digest_a: String,
+        #[arg(long, default_value = "")]
+        credential_digest_b: String,
+        #[arg(long, default_value = "")]
+        handshake_transcript_digest: String,
+        #[arg(long)]
+        expires_at: Option<String>,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 读取会话
+    Read {
+        session_id: String,
+    },
+    /// 关闭 session
+    Close {
+        session_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CnvAction {
+    /// CNV 全链路校验
+    Verify {
+        #[arg(long)]
+        receipt: String,
     },
 }
 
@@ -371,6 +562,79 @@ fn main() -> anyhow::Result<()> {
                         println!("  {} | L{} | zones {:?} | parent {:?}",
                             id, identity.level, identity.zones, identity.parent_id);
                     }
+                }
+                AgentAction::Status { agent_id } => {
+                    let status = baize.credential_status(&agent_id)?;
+                    println!("Agent {} 状态: {}", agent_id, status);
+                }
+                AgentAction::Suspend { agent_id, reason } => {
+                    baize.update_credential_status(
+                        &agent_id,
+                        baize_core::cert::CredentialStatus::Suspended,
+                        &reason,
+                    )?;
+                    println!("Agent {} 已暂停", agent_id);
+                }
+                AgentAction::Reactivate { agent_id, reason } => {
+                    baize.update_credential_status(
+                        &agent_id,
+                        baize_core::cert::CredentialStatus::Active,
+                        &reason,
+                    )?;
+                    println!("Agent {} 已恢复", agent_id);
+                }
+                AgentAction::Proof { agent_id } => {
+                    let now = chrono::Utc::now();
+                    let proof_id = format!("proof-{}-{}", agent_id, now.timestamp_millis());
+                    let expires = (now + chrono::Duration::minutes(5)).to_rfc3339();
+
+                    // credential_digest: agent credential blob 的 hash
+                    let credential_digest = {
+                        let mut filter = HashMap::new();
+                        filter.insert("type".to_string(), "agent-cert".to_string());
+                        filter.insert("x-cert-agent".to_string(), agent_id.clone());
+                        let certs = baize.storage.blob_query(&filter)?;
+                        certs.first()
+                            .map(|b| b.hash.clone())
+                            .ok_or_else(|| anyhow::anyhow!("agent certificate not found: {}", agent_id))?
+                    };
+
+                    // instance_state_attributes: 默认运行态属性
+                    let instance_attrs = serde_json::json!({
+                        "instance_id": agent_id,
+                        "instance_status": "running"
+                    });
+
+                    // binding_context_digest: credential_digest + timestamp 摘要
+                    let binding_input = format!("{}:{}", credential_digest, now.to_rfc3339());
+                    let binding_digest = format!("sha256:{}", {
+                        use sha2::Digest;
+                        let mut hasher = sha2::Sha256::new();
+                        hasher.update(binding_input.as_bytes());
+                        hex::encode(hasher.finalize())
+                    });
+
+                    let proof = baize_asl::payload::RuntimeProofContent {
+                        proof_id: proof_id.clone(),
+                        credential_digest: credential_digest.clone(),
+                        instance_state_attributes: instance_attrs,
+                        binding_context_digest: binding_digest,
+                        proof_anchor_mode: baize_asl::payload::ProofAnchorMode::CredentialAnchored,
+                        issued_at: now.to_rfc3339(),
+                        expires_at: expires.clone(),
+                    };
+                    let content = serde_json::to_string(&proof)?;
+                    let labels = HashMap::from([
+                        ("type".to_string(), "runtime-proof".to_string()),
+                        ("x-proof-agent".to_string(), agent_id.clone()),
+                        ("x-proof-credential".to_string(), credential_digest),
+                    ]);
+                    let blob = baize.pipe_blob_write(&agent_id, &content, &labels)?;
+                    println!("运行态证明已生成:");
+                    println!("  Hash: {}", blob.hash);
+                    println!("  Proof ID: {}", proof_id);
+                    println!("  Anchor: CredentialAnchored");
+                    println!("  Expires: {}", expires);
                 }
             }
             Ok(())
@@ -514,18 +778,43 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        Commands::Audit => {
-            let baize = open_baize()?;
-            let mut filter = HashMap::new();
-            filter.insert("x-audit".to_string(), "true".to_string());
-            let blobs = baize.storage.blob_query(&filter)?;
-            println!("审计日志 ({} 条):", blobs.len());
-            for b in &blobs {
-                println!("  {} | {} | {}",
-                    &b.hash[..12.min(b.hash.len())],
-                    b.labels.get("x-audit-type").unwrap_or(&"-".to_string()),
-                    b.labels.get("x-audit-agent").unwrap_or(&"-".to_string()),
-                );
+        Commands::Audit { action } => {
+            match action {
+                Some(AuditAction::ChainVerify) => {
+                    let baize = open_baize()?;
+                    let result = baize.verify_chain()?;
+                    println!("审计链验证:");
+                    println!("  有效: {}", result.valid);
+                    println!("  链长: {}", result.chain_length);
+                    if !result.head_digest.is_empty() {
+                        println!("  链头: {}", &result.head_digest[..16.min(result.head_digest.len())]);
+                        println!("  创世: {}", &result.genesis_digest[..16.min(result.genesis_digest.len())]);
+                    }
+                    if !result.errors.is_empty() {
+                        println!("  错误:");
+                        for e in &result.errors {
+                            println!("    - {}", e);
+                        }
+                    }
+                }
+                Some(AuditAction::Log) | None => {
+                    let baize = open_baize()?;
+                    let mut filter = HashMap::new();
+                    filter.insert("x-audit".to_string(), "true".to_string());
+                    let blobs = baize.storage.blob_query(&filter)?;
+                    println!("审计日志 ({} 条):", blobs.len());
+                    for b in &blobs {
+                        let chain_idx = b.labels.get("x-audit-chain-index")
+                            .map(|s| s.as_str())
+                            .unwrap_or("-");
+                        println!("  {} | {} | {} | idx={}",
+                            &b.hash[..12.min(b.hash.len())],
+                            b.labels.get("x-audit-type").unwrap_or(&"-".to_string()),
+                            b.labels.get("x-audit-agent").unwrap_or(&"-".to_string()),
+                            chain_idx,
+                        );
+                    }
+                }
             }
             Ok(())
         }
@@ -611,6 +900,255 @@ fn main() -> anyhow::Result<()> {
             let baize = open_baize()?;
             let result = baize.pipe_pull(&agent, r#ref.as_deref())?;
             println!("Pull 成功: {} 个文件", result.files);
+            Ok(())
+        }
+
+        // ─── v1 新增 CLI 命令 ───
+
+        Commands::Intent { action } => {
+            match action {
+                IntentAction::Create { content, agent } => {
+                    let baize = open_baize()?;
+                    let payload = baize_asl::AslAdapter::intent_from_blob(&content)?;
+                    let labels = baize_asl::AslAdapter::intent_to_labels(&payload);
+                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    println!("意图创建成功: {}", blob.hash);
+                }
+                IntentAction::Derive { content, agent } => {
+                    let baize = open_baize()?;
+                    let payload = baize_asl::AslAdapter::sub_intent_from_blob(&content)?;
+                    let labels = baize_asl::AslAdapter::sub_intent_to_labels(&payload);
+                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    println!("子意图派生成功: {}", blob.hash);
+                }
+                IntentAction::Read { hash } => {
+                    let baize = open_baize()?;
+                    let blob = baize.storage.blob_read(&hash)?;
+                    println!("Hash: {}", blob.hash);
+                    println!("Content: {}", blob.content);
+                    println!("Labels: {:?}", blob.labels);
+                }
+                IntentAction::Query { status, owner } => {
+                    let baize = open_baize()?;
+                    let mut filter = HashMap::new();
+                    filter.insert("type".to_string(), "intent".to_string());
+                    if let Some(s) = status {
+                        filter.insert("x-intent-status".to_string(), s);
+                    }
+                    if let Some(o) = owner {
+                        filter.insert("x-intent-owner".to_string(), o);
+                    }
+                    let blobs = baize.storage.blob_query_metadata(&filter)?;
+                    println!("找到 {} 条意图:", blobs.len());
+                    for (hash, labels) in &blobs {
+                        println!("  {} | {} | {}",
+                            &hash[..12.min(hash.len())],
+                            labels.get("x-intent-id").unwrap_or(&"-".to_string()),
+                            labels.get("x-intent-status").unwrap_or(&"-".to_string()),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        Commands::Receipt { action } => {
+            match action {
+                ReceiptAction::Create { content, agent } => {
+                    let baize = open_baize()?;
+                    let payload = baize_asl::AslAdapter::receipt_from_blob(&content)?;
+                    let labels = baize_asl::AslAdapter::receipt_to_labels(&payload);
+                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    println!("回执创建成功: {}", blob.hash);
+                }
+                ReceiptAction::Read { hash } => {
+                    let baize = open_baize()?;
+                    let blob = baize.storage.blob_read(&hash)?;
+                    println!("Hash: {}", blob.hash);
+                    println!("Content: {}", blob.content);
+                    println!("Labels: {:?}", blob.labels);
+                }
+                ReceiptAction::Query { executor, status } => {
+                    let baize = open_baize()?;
+                    let mut filter = HashMap::new();
+                    filter.insert("type".to_string(), "receipt".to_string());
+                    if let Some(e) = executor {
+                        filter.insert("x-receipt-executor".to_string(), e);
+                    }
+                    if let Some(s) = status {
+                        filter.insert("x-receipt-status".to_string(), s);
+                    }
+                    let records = baize.storage.blob_query_metadata(&filter)?;
+                    println!("找到 {} 条回执:", records.len());
+                    for (hash, labels) in &records {
+                        println!("  {} | {} | {} | {}",
+                            &hash[..12.min(hash.len())],
+                            labels.get("x-receipt-id").unwrap_or(&"-".to_string()),
+                            labels.get("x-receipt-executor").unwrap_or(&"-".to_string()),
+                            labels.get("x-receipt-status").unwrap_or(&"-".to_string()),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        Commands::Authz { action } => {
+            match action {
+                AuthzAction::Issue { content, agent } => {
+                    let baize = open_baize()?;
+                    let payload = baize_asl::AslAdapter::authorization_from_blob(&content)?;
+                    let labels = baize_asl::AslAdapter::authorization_to_labels(&payload);
+                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    println!("授权签发成功: {}", blob.hash);
+                }
+                AuthzAction::Delegate { content, agent } => {
+                    let baize = open_baize()?;
+                    let payload = baize_asl::AslAdapter::authorization_from_blob(&content)?;
+                    let labels = baize_asl::AslAdapter::authorization_to_labels(&payload);
+                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    println!("委托子授权成功: {}", blob.hash);
+                }
+                AuthzAction::Verify { hash, action_type } => {
+                    let baize = open_baize()?;
+                    let result = baize_asl::verify::verify_authorization(
+                        &baize.storage, &hash, &action_type,
+                        &baize_asl::verify::ExecutionContext::default(),
+                    )?;
+                    println!("授权校验结果:");
+                    println!("  有效: {}", result.valid);
+                    println!("  校验项: {:?}", result.checks);
+                    if !result.errors.is_empty() {
+                        println!("  错误:");
+                        for e in &result.errors {
+                            println!("    - {}", e);
+                        }
+                    }
+                }
+                AuthzAction::Read { hash } => {
+                    let baize = open_baize()?;
+                    let blob = baize.storage.blob_read(&hash)?;
+                    println!("Hash: {}", blob.hash);
+                    println!("Content: {}", blob.content);
+                    println!("Labels: {:?}", blob.labels);
+                }
+            }
+            Ok(())
+        }
+
+        Commands::Session { action } => {
+            match action {
+                SessionAction::Create {
+                    session_id, peer_a, peer_b,
+                    ephemeral_pub, cipher_suites,
+                    credential_digest_a, credential_digest_b,
+                    handshake_transcript_digest,
+                    expires_at, agent,
+                } => {
+                    let baize = open_baize()?;
+                    let now = chrono::Utc::now();
+                    let expires = expires_at.unwrap_or_else(|| {
+                        (now + chrono::Duration::minutes(30)).to_rfc3339()
+                    });
+                    let content = serde_json::json!({
+                        "session_id": session_id,
+                        "peer_a": peer_a,
+                        "peer_b": peer_b,
+                        "credential_hash_a": credential_digest_a,
+                        "credential_hash_b": credential_digest_b,
+                        "handshake_transcript_hash": handshake_transcript_digest,
+                        "ephemeral_pub": ephemeral_pub,
+                        "cipher_suites": cipher_suites,
+                        "established_at": now.to_rfc3339(),
+                        "expires_at": expires,
+                    }).to_string();
+                    let labels = HashMap::from([
+                        ("type".to_string(), "session-init".to_string()),
+                        ("x-session-id".to_string(), session_id.clone()),
+                        ("x-session-peer-a".to_string(), peer_a.clone()),
+                        ("x-session-peer-b".to_string(), peer_b.clone()),
+                        ("x-session-status".to_string(), "active".to_string()),
+                    ]);
+                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    println!("会话创建成功:");
+                    println!("  Hash: {}", blob.hash);
+                    println!("  Session ID: {}", session_id);
+                    println!("  Peer A: {}", peer_a);
+                    println!("  Peer B: {}", peer_b);
+                    println!("  Status: active");
+                }
+                SessionAction::Read { session_id } => {
+                    let baize = open_baize()?;
+                    let mut filter = HashMap::new();
+                    filter.insert("type".to_string(), "session-init".to_string());
+                    filter.insert("x-session-id".to_string(), session_id.clone());
+                    let blobs = baize.storage.blob_query(&filter)?;
+                    if let Some(blob) = blobs.first() {
+                        println!("Session ID: {}", session_id);
+                        println!("Hash: {}", blob.hash);
+                        println!("Content: {}", blob.content);
+                        println!("Labels: {:?}", blob.labels);
+                        println!("Created: {}", blob.created_at);
+                    } else {
+                        println!("会话 {} 未找到", session_id);
+                    }
+                }
+                SessionAction::Close { session_id, reason, agent } => {
+                    let baize = open_baize()?;
+
+                    // 验证 session 存在
+                    let mut filter = HashMap::new();
+                    filter.insert("type".to_string(), "session-init".to_string());
+                    filter.insert("x-session-id".to_string(), session_id.clone());
+                    let sessions = baize.storage.blob_query(&filter)?;
+                    if sessions.is_empty() {
+                        anyhow::bail!("session {} not found", session_id);
+                    }
+
+                    // 检查是否已关闭
+                    let mut close_filter = HashMap::new();
+                    close_filter.insert("type".to_string(), "session-close".to_string());
+                    close_filter.insert("x-session-id".to_string(), session_id.clone());
+                    let close_blobs = baize.storage.blob_query(&close_filter)?;
+                    if !close_blobs.is_empty() {
+                        anyhow::bail!("session {} already closed", session_id);
+                    }
+
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let close_content = serde_json::json!({
+                        "session_id": session_id,
+                        "action": "close",
+                        "closed_by": agent,
+                        "reason": reason.unwrap_or_default(),
+                    }).to_string();
+                    let labels = HashMap::from([
+                        ("type".to_string(), "session-close".to_string()),
+                        ("x-session-id".to_string(), session_id.clone()),
+                        ("x-session-status".to_string(), "closed".to_string()),
+                        ("x-session-closed-at".to_string(), now),
+                    ]);
+                    let blob = baize.pipe_blob_write(&agent, &close_content, &labels)?;
+                    println!("Session {} 已关闭: {}", session_id, blob.hash);
+                }
+            }
+            Ok(())
+        }
+
+        Commands::Cnv { action } => {
+            match action {
+                CnvAction::Verify { receipt } => {
+                    let baize = open_baize()?;
+                    let result = baize_asl::verify::cnv_verify(&baize.storage, &receipt)?;
+                    println!("CNV 全链路校验:");
+                    println!("  有效: {}", result.valid);
+                    if !result.errors.is_empty() {
+                        println!("  错误:");
+                        for e in &result.errors {
+                            println!("    - {}", e);
+                        }
+                    }
+                }
+            }
             Ok(())
         }
 

@@ -10,8 +10,12 @@ path = "src/main.rs"
 [dependencies]
 baize-core = { path = "../baize-core" }
 baize-server = { path = "../baize-server" }
+baize-asl = { path = "../baize-asl" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

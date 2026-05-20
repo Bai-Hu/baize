@@ -65,6 +65,43 @@ fn delete_req(uri: &str, agent_id: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// 创建带 HMAC-SHA256 签名的 POST 请求
+fn post_json_signed(
+    uri: &str,
+    body: Value,
+    agent_id: &str,
+    signing_key: &[u8],
+) -> Request<Body> {
+    let body_str = serde_json::to_string(&body).unwrap();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let method = "POST";
+    let sig = baize_server::pipeline::auth::compute_signature(
+        signing_key, &timestamp, method, uri, &body_str,
+    );
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-agent-id", agent_id)
+        .header("x-timestamp", &timestamp)
+        .header("x-signature", &sig)
+        .body(Body::from(body_str))
+        .unwrap()
+}
+
+/// 获取 agent 的签名密钥（从 test app 的 Baize 实例中）
+/// 注意：这需要在创建 app 前提取密钥，或使用已知密钥。
+/// 为简化测试，直接用 extract_signing_key 从已知 PEM 计算。
+fn get_test_signing_key(baize: &Baize, agent_id: &str) -> Vec<u8> {
+    let mut filter = std::collections::HashMap::new();
+    filter.insert("type".to_string(), "agent-key".to_string());
+    filter.insert("agent-id".to_string(), agent_id.to_string());
+    filter.insert("x-key-purpose".to_string(), "IDN_SIGN".to_string());
+    let keys = baize.storage.blob_query(&filter).unwrap_or_default();
+    let key_blob = keys.first().expect("agent should have an IDN_SIGN key");
+    baize_server::pipeline::auth::extract_signing_key(&key_blob.content)
+}
+
 // ─── 1. Agent 管理 ───
 
 #[tokio::test]
@@ -877,7 +914,7 @@ async fn test_file_zone_root_accessible() {
     );
     send(&app, req).await;
 
-    // root 写入根级文件（无 / 前缀段）
+    // root 写入根级文件（无 / 前缀段）→ push 到主仓库
     let req = post_json(
         "/api/v0/files/README.md",
         json!({"content": "# Hello"}),
@@ -885,6 +922,22 @@ async fn test_file_zone_root_accessible() {
     );
     let (status, _) = send(&app, req).await;
     assert_eq!(status, StatusCode::CREATED);
+
+    // root push 到主仓库
+    let req = post_json(
+        "/api/v0/push",
+        json!({"message": "add README"}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // zone-a pull → 文件出现在 zone-a workspace
+    let req = post_json(
+        "/api/v0/pull",
+        json!({}),
+        Some("zone-a"),
+    );
+    send(&app, req).await;
 
     // zone-a agent 可以读取根级文件（无 zone 限制）
     let req = get_req_with_agent("/api/v0/files/README.md", "zone-a");
@@ -942,4 +995,975 @@ async fn test_file_level0_cannot_write() {
     let (status, body) = send(&app, req).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(body["error"].as_str().unwrap().contains("permission denied"));
+}
+
+// ─── v1 API 集成测试 ───
+
+fn put_json(uri: &str, body: Value, agent_id: &str) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-agent-id", agent_id)
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_v1_intent_create_and_read() {
+    let app = test_app();
+
+    let intent_content = json!({
+        "intent_id": "int-test-001",
+        "intent_owner": "baize-root",
+        "intent_creator": "baize-root",
+        "intent_goal": "deploy",
+        "intent_constraints": {"budget": 100},
+        "version": "1.0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-12-31T23:59:59Z",
+    });
+    let req = post_json(
+        "/api/v1/intents",
+        json!({"content": serde_json::to_string(&intent_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let hash = body["hash"].as_str().unwrap();
+    assert!(!hash.is_empty());
+
+    let req = get_req(&format!("/api/v1/intents/{}", hash));
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hash"], hash);
+    assert!(body["content"].as_str().unwrap().contains("int-test-001"));
+}
+
+#[tokio::test]
+async fn test_v1_intent_create_invalid_json() {
+    let app = test_app();
+    let req = post_json(
+        "/api/v1/intents",
+        json!({"content": "not valid json for intent"}),
+        Some("baize-root"),
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_v1_intent_query() {
+    let app = test_app();
+    let intent_content = json!({
+        "intent_id": "int-q-001",
+        "intent_owner": "baize-root",
+        "intent_creator": "baize-root",
+        "intent_goal": "query-test",
+        "intent_constraints": {"budget": 50},
+        "version": "1.0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-12-31T23:59:59Z",
+    });
+    let req = post_json(
+        "/api/v1/intents",
+        json!({"content": serde_json::to_string(&intent_content).unwrap()}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    let req = get_req("/api/v1/intents?status=active");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let intents = body["intents"].as_array().unwrap();
+    assert!(!intents.is_empty());
+}
+
+#[tokio::test]
+async fn test_v1_receipt_create_and_read() {
+    let app = test_app();
+
+    // 先创建 intent（receipt 需要引用真实存在的 intent digest）
+    let intent_content = json!({
+        "intent_id": "int-rct-001",
+        "intent_owner": "baize-root",
+        "intent_creator": "baize-root",
+        "intent_goal": "receipt-test",
+        "intent_constraints": {"budget": 100},
+        "version": "1.0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-12-31T23:59:59Z",
+    });
+    let req = post_json(
+        "/api/v1/intents",
+        json!({"content": serde_json::to_string(&intent_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let intent_hash = body["hash"].as_str().unwrap();
+
+    // 注册 agent 并创建 agent-cert blob（receipt 引用的 authorization 需要 issuer 有 cert）
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "rct-agent", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 创建 authorization
+    let authz_content = json!({
+        "authorization_id": "authz-rct-001",
+        "issuer": "baize-root",
+        "subject": "rct-agent",
+        "grant_type": "execute",
+        "constraints": {"amount_scope": {"max_amount": 200}},
+        "delegatable": false,
+        "source_intent_digest": intent_hash,
+        "root_authorizer": "baize-root",
+        "nbf": "2026-01-01T00:00:00Z",
+        "exp": "2026-12-31T23:59:59Z",
+        "iat": "2026-01-01T00:00:00Z",
+        "jti": "jti-rct-001",
+        "version": "1.0",
+    });
+    let req = post_json(
+        "/api/v1/authorizations",
+        json!({"content": serde_json::to_string(&authz_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let authz_hash = body["hash"].as_str().unwrap();
+
+    // 创建 receipt
+    let receipt_content = json!({
+        "receipt_id": "rct-001",
+        "executor_id": "baize-root",
+        "task_id": "task-001",
+        "action_type": "execute",
+        "intent_digest": intent_hash,
+        "authorization_digest": authz_hash,
+        "result_status": "SUCCEEDED",
+        "started_at": "2026-01-01T00:00:00Z",
+        "finished_at": "2026-01-01T00:01:00Z",
+    });
+    let req = post_json(
+        "/api/v1/receipts",
+        json!({"content": serde_json::to_string(&receipt_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let hash = body["hash"].as_str().unwrap();
+
+    let req = get_req(&format!("/api/v1/receipts/{}", hash));
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["content"].as_str().unwrap().contains("rct-001"));
+}
+
+#[tokio::test]
+async fn test_v1_authorization_create_and_verify() {
+    let app = test_app();
+
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "auth-agent", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 创建意图
+    let intent_content = json!({
+        "intent_id": "int-auth-001",
+        "intent_owner": "baize-root",
+        "intent_creator": "baize-root",
+        "intent_goal": "authorize-test",
+        "intent_constraints": {"budget": 200},
+        "version": "1.0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-12-31T23:59:59Z",
+    });
+    let req = post_json(
+        "/api/v1/intents",
+        json!({"content": serde_json::to_string(&intent_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let intent_hash = body["hash"].as_str().unwrap();
+
+    // 创建授权
+    let authz_content = json!({
+        "authorization_id": "authz-001",
+        "issuer": "baize-root",
+        "subject": "auth-agent",
+        "grant_type": "execute",
+        "constraints": {"amount_scope": {"max_amount": 200}},
+        "delegatable": false,
+        "source_intent_digest": intent_hash,
+        "root_authorizer": "baize-root",
+        "nbf": "2026-01-01T00:00:00Z",
+        "exp": "2026-12-31T23:59:59Z",
+        "iat": "2026-01-01T00:00:00Z",
+        "jti": "jti-001",
+        "version": "1.0",
+    });
+    let req = post_json(
+        "/api/v1/authorizations",
+        json!({"content": serde_json::to_string(&authz_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let authz_hash = body["hash"].as_str().unwrap();
+
+    // 读取授权
+    let req = get_req(&format!("/api/v1/authorizations/{}", authz_hash));
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["content"].as_str().unwrap().contains("authz-001"));
+
+    // 校验授权
+    let req = post_json(
+        &format!("/api/v1/authorizations/{}/verify", authz_hash),
+        json!({"action_type": "execute"}),
+        None,
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["valid"], true);
+    // 验证 checks 为命名对象格式（协议 §13.4）
+    assert!(body["checks"]["credential_authenticity"].is_boolean());
+    assert!(body["checks"]["delegation_chain"].is_boolean());
+}
+
+#[tokio::test]
+async fn test_v1_audit_verify_chain() {
+    let app = test_app();
+
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": "chain test data"}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": "chain test data 2"}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    let req = post_json("/api/v1/audit/verify-chain", json!({}), None);
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["valid"], true);
+    assert!(body["chain_length"].as_u64().unwrap() >= 2);
+}
+
+#[tokio::test]
+async fn test_v1_agent_status() {
+    let app = test_app();
+
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "status-agent", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    let req = get_req("/api/v1/agents/status-agent/status");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "active");
+
+    let req = put_json(
+        "/api/v1/agents/status-agent/status",
+        json!({"status": "suspended", "reason": "testing"}),
+        "baize-root",
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "suspended");
+
+    let req = get_req("/api/v1/agents/status-agent/status");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "suspended");
+}
+
+#[tokio::test]
+async fn test_v1_cnv_verify_invalid_receipt() {
+    let app = test_app();
+    let req = post_json(
+        "/api/v1/cnv/verify",
+        json!({"receipt_digest": "sha256:nonexistent"}),
+        None,
+    );
+    let (status, body) = send(&app, req).await;
+    // 不存在的 receipt 返回 400（ChainBroken）
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("chain broken"));
+}
+
+#[tokio::test]
+async fn test_v1_v0_routes_work_under_v1() {
+    let app = test_app();
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "compat-agent", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let req = get_req("/api/v1/agents");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().unwrap().iter().any(|a| a["id"] == "compat-agent"));
+}
+
+#[tokio::test]
+async fn test_v1_session_close() {
+    let app = test_app();
+
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "peer-a", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "peer-b", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 创建 session-init
+    let init_content = json!({
+        "ephemeral_pub": "fake-pub-key-a",
+        "cipher_suites": ["AES-256-GCM"],
+        "credential_digest": "sha256:fake-cred-a",
+    });
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": serde_json::to_string(&init_content).unwrap(), "labels": {
+            "type": "session-init",
+            "x-session-id": "sess-close-test",
+            "x-session-peer-a": "peer-a",
+            "x-session-peer-b": "peer-b",
+        }}),
+        Some("peer-a"),
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 创建 session-accept（关闭前需要完成握手）
+    let accept_content = json!({
+        "ephemeral_pub": "fake-pub-key-b",
+        "selected_cipher": "AES-256-GCM",
+    });
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": serde_json::to_string(&accept_content).unwrap(), "labels": {
+            "type": "session-accept",
+            "x-session-id": "sess-close-test",
+            "x-session-peer-a": "peer-a",
+            "x-session-peer-b": "peer-b",
+        }}),
+        Some("peer-b"),
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 关闭 session
+    let req = post_json(
+        "/api/v1/sessions/sess-close-test/close",
+        json!({"reason": "done"}),
+        Some("peer-a"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["session_id"], "sess-close-test");
+    assert_eq!(body["status"], "closed");
+}
+
+#[tokio::test]
+async fn test_v1_session_create_and_read() {
+    let app = test_app();
+
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "sess-peer-a", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "sess-peer-b", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 创建会话
+    let req = post_json(
+        "/api/v1/sessions",
+        json!({
+            "session_id": "sess-api-test",
+            "peer_a": "sess-peer-a",
+            "peer_b": "sess-peer-b",
+            "ephemeral_pub": "test-pub-key",
+            "cipher_suites": ["AES-256-GCM"],
+            "credential_digest": "sha256:test-cred",
+        }),
+        Some("sess-peer-a"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["session_id"], "sess-api-test");
+    assert_eq!(body["peer_a"], "sess-peer-a");
+    assert_eq!(body["peer_b"], "sess-peer-b");
+    assert_eq!(body["status"], "active");
+
+    // 读取会话
+    let req = get_req("/api/v1/sessions/sess-api-test");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["session_id"], "sess-api-test");
+
+    // 读取不存在的会话
+    let req = get_req("/api/v1/sessions/nonexistent");
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_v1_cnv_verify_response_format() {
+    let app = test_app();
+
+    // 创建完整的 intent → authz → receipt 链
+    let intent_content = json!({
+        "intent_id": "int-cnv-fmt",
+        "intent_owner": "baize-root",
+        "intent_creator": "baize-root",
+        "intent_goal": "cnv-format-test",
+        "intent_constraints": {"budget": 100},
+        "version": "1.0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-12-31T23:59:59Z",
+    });
+    let req = post_json(
+        "/api/v1/intents",
+        json!({"content": serde_json::to_string(&intent_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let intent_hash = body["hash"].as_str().unwrap();
+
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "cnv-executor", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    let authz_content = json!({
+        "authorization_id": "authz-cnv-fmt",
+        "issuer": "baize-root",
+        "subject": "cnv-executor",
+        "grant_type": "execute",
+        "constraints": {"amount_scope": {"max_amount": 200}},
+        "delegatable": false,
+        "source_intent_digest": intent_hash,
+        "root_authorizer": "baize-root",
+        "nbf": "2026-01-01T00:00:00Z",
+        "exp": "2026-12-31T23:59:59Z",
+        "iat": "2026-01-01T00:00:00Z",
+        "jti": "jti-cnv-fmt",
+        "version": "1.0",
+    });
+    let req = post_json(
+        "/api/v1/authorizations",
+        json!({"content": serde_json::to_string(&authz_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let authz_hash = body["hash"].as_str().unwrap();
+
+    let receipt_content = json!({
+        "receipt_id": "rct-cnv-fmt",
+        "executor_id": "baize-root",
+        "task_id": "task-cnv-fmt",
+        "action_type": "execute",
+        "intent_digest": intent_hash,
+        "authorization_digest": authz_hash,
+        "result_status": "SUCCEEDED",
+        "started_at": "2026-01-01T00:00:00Z",
+        "finished_at": "2026-01-01T00:01:00Z",
+    });
+    let req = post_json(
+        "/api/v1/receipts",
+        json!({"content": serde_json::to_string(&receipt_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let receipt_hash = body["hash"].as_str().unwrap();
+
+    // 执行 CNV 校验
+    let req = post_json(
+        "/api/v1/cnv/verify",
+        json!({"receipt_digest": receipt_hash}),
+        None,
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    // 验证响应格式（协议 §13.6）
+    assert!(body["valid"].is_boolean());
+    assert!(body["intent_chain"].is_array());
+    assert!(body["authorization_chain"].is_array());
+    assert!(body["errors"].is_array());
+}
+
+// ─── 签名认证测试 ───
+
+#[tokio::test]
+async fn test_v1_signature_verified_request_succeeds() {
+    // 先获取 Baize 实例的密钥，再创建 app
+    let baize = Baize::init_in_memory().unwrap();
+    let signing_key = get_test_signing_key(&baize, "baize-root");
+    let app = api::app(baize);
+
+    let req = post_json_signed(
+        "/api/v1/blobs",
+        json!({"content": "signed blob data", "labels": {"type": "test-signed"}}),
+        "baize-root",
+        &signing_key,
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["hash"].is_string());
+}
+
+#[tokio::test]
+async fn test_v1_signature_wrong_key_rejected() {
+    let baize = Baize::init_in_memory().unwrap();
+    let app = api::app(baize);
+
+    // 用错误的密钥签名
+    let wrong_key = baize_server::pipeline::auth::extract_signing_key("wrong-key-pem");
+    let req = post_json_signed(
+        "/api/v1/blobs",
+        json!({"content": "tampered data"}),
+        "baize-root",
+        &wrong_key,
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "authentication failed");
+}
+
+#[tokio::test]
+async fn test_v1_signature_expired_timestamp_rejected() {
+    let baize = Baize::init_in_memory().unwrap();
+    let signing_key = get_test_signing_key(&baize, "baize-root");
+    let app = api::app(baize);
+
+    // 用 10 分钟前的时间戳（超过 5 分钟窗口）
+    let past = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+    let body_str = serde_json::to_string(&json!({"content": "expired"})).unwrap();
+    let sig = baize_server::pipeline::auth::compute_signature(
+        &signing_key, &past, "POST", "/api/v1/blobs", &body_str,
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/blobs")
+        .header("content-type", "application/json")
+        .header("x-agent-id", "baize-root")
+        .header("x-timestamp", &past)
+        .header("x-signature", &sig)
+        .body(Body::from(body_str))
+        .unwrap();
+
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "authentication failed");
+}
+
+#[tokio::test]
+async fn test_v1_no_signature_fallback_succeeds() {
+    let app = test_app();
+    // 无签名头的普通请求仍能通过（过渡期 fallback）
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": "unsigned data"}),
+        Some("baize-root"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["hash"].is_string());
+}
+
+// ─── 补充测试：Agent Proof 生成 ───
+
+#[tokio::test]
+async fn test_v1_agent_proof_generation() {
+    let app = test_app();
+
+    // 注册 agent
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "proof-agent", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 生成运行态证明
+    let req = post_json(
+        "/api/v1/agents/proof-agent/proof",
+        json!({"instance_state_attributes": {"instance_id": "proof-agent", "status": "running"}}),
+        Some("baize-root"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["hash"].is_string());
+    assert!(body["proof_id"].as_str().unwrap().starts_with("proof-proof-agent-"));
+    assert!(body["expires_at"].is_string());
+}
+
+#[tokio::test]
+async fn test_v1_agent_proof_default_attrs() {
+    let app = test_app();
+
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "proof-default", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 不提供 instance_state_attributes，使用默认值
+    let req = post_json(
+        "/api/v1/agents/proof-default/proof",
+        json!({}),
+        Some("baize-root"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["hash"].is_string());
+}
+
+// ─── 补充测试：CNV 正向全链路校验 ───
+
+#[tokio::test]
+async fn test_v1_cnv_verify_full_chain_valid() {
+    let app = test_app();
+
+    // 创建意图
+    let intent_content = json!({
+        "intent_id": "int-cnv-full",
+        "intent_owner": "baize-root",
+        "intent_creator": "baize-root",
+        "intent_goal": "cnv-full-valid-test",
+        "intent_constraints": {"budget": 500},
+        "version": "1.0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-12-31T23:59:59Z",
+    });
+    let req = post_json(
+        "/api/v1/intents",
+        json!({"content": serde_json::to_string(&intent_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let intent_hash = body["hash"].as_str().unwrap();
+
+    // 注册 executor
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "cnv-exec-full", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 创建授权
+    let authz_content = json!({
+        "authorization_id": "authz-cnv-full",
+        "issuer": "baize-root",
+        "subject": "cnv-exec-full",
+        "grant_type": "execute",
+        "constraints": {"amount_scope": {"max_amount": 500}},
+        "delegatable": false,
+        "source_intent_digest": intent_hash,
+        "root_authorizer": "baize-root",
+        "nbf": "2026-01-01T00:00:00Z",
+        "exp": "2026-12-31T23:59:59Z",
+        "iat": "2026-01-01T00:00:00Z",
+        "jti": "jti-cnv-full",
+        "version": "1.0",
+    });
+    let req = post_json(
+        "/api/v1/authorizations",
+        json!({"content": serde_json::to_string(&authz_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let authz_hash = body["hash"].as_str().unwrap();
+
+    // 创建回执
+    let receipt_content = json!({
+        "receipt_id": "rct-cnv-full",
+        "executor_id": "baize-root",
+        "task_id": "task-cnv-full",
+        "action_type": "execute",
+        "intent_digest": intent_hash,
+        "authorization_digest": authz_hash,
+        "result_status": "SUCCEEDED",
+        "started_at": "2026-01-01T00:00:00Z",
+        "finished_at": "2026-01-01T00:01:00Z",
+    });
+    let req = post_json(
+        "/api/v1/receipts",
+        json!({"content": serde_json::to_string(&receipt_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let receipt_hash = body["hash"].as_str().unwrap();
+
+    // CNV 校验应通过
+    let req = post_json(
+        "/api/v1/cnv/verify",
+        json!({"receipt_digest": receipt_hash}),
+        None,
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["valid"], true, "CNV should be valid: {:?}", body["errors"]);
+    assert!(body["errors"].as_array().unwrap().is_empty());
+}
+
+// ─── 补充测试：凭证状态非法转换 ───
+
+#[tokio::test]
+async fn test_v1_credential_invalid_transition_revoked_to_active() {
+    let app = test_app();
+
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "transition-agent", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 撤销
+    let req = put_json(
+        "/api/v1/agents/transition-agent/status",
+        json!({"status": "revoked", "reason": "compromised"}),
+        "baize-root",
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 尝试恢复已撤销的凭证（应该失败）
+    let req = put_json(
+        "/api/v1/agents/transition-agent/status",
+        json!({"status": "active", "reason": "attempt reactivate"}),
+        "baize-root",
+    );
+    let (status, body) = send(&app, req).await;
+    // revoked agent 已从内存移除，返回 404 (not found) 或 400 (validation)
+    assert!(
+        status == StatusCode::NOT_FOUND || status == StatusCode::BAD_REQUEST,
+        "revoked→active should fail, got {} {:?}",
+        status, body,
+    );
+}
+
+#[tokio::test]
+async fn test_v1_credential_suspend_and_reactivate() {
+    let app = test_app();
+
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "suspend-agent", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 暂停
+    let req = put_json(
+        "/api/v1/agents/suspend-agent/status",
+        json!({"status": "suspended", "reason": "maintenance"}),
+        "baize-root",
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "suspended");
+
+    // 恢复
+    let req = put_json(
+        "/api/v1/agents/suspend-agent/status",
+        json!({"status": "active", "reason": "restored"}),
+        "baize-root",
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "active");
+}
+
+// ─── 补充测试：Receipt Query Filters ───
+
+#[tokio::test]
+async fn test_v1_receipt_query_with_filters() {
+    let app = test_app();
+
+    // 创建意图
+    let intent_content = json!({
+        "intent_id": "int-rq",
+        "intent_owner": "baize-root",
+        "intent_creator": "baize-root",
+        "intent_goal": "receipt-query-test",
+        "intent_constraints": {"budget": 100},
+        "version": "1.0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-12-31T23:59:59Z",
+    });
+    let req = post_json(
+        "/api/v1/intents",
+        json!({"content": serde_json::to_string(&intent_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let intent_hash = body["hash"].as_str().unwrap();
+
+    let authz_content = json!({
+        "authorization_id": "authz-rq",
+        "issuer": "baize-root",
+        "subject": "baize-root",
+        "grant_type": "execute",
+        "constraints": {"amount_scope": {"max_amount": 200}},
+        "delegatable": false,
+        "source_intent_digest": intent_hash,
+        "root_authorizer": "baize-root",
+        "nbf": "2026-01-01T00:00:00Z",
+        "exp": "2026-12-31T23:59:59Z",
+        "iat": "2026-01-01T00:00:00Z",
+        "jti": "jti-rq",
+        "version": "1.0",
+    });
+    let req = post_json(
+        "/api/v1/authorizations",
+        json!({"content": serde_json::to_string(&authz_content).unwrap()}),
+        Some("baize-root"),
+    );
+    let (_, body) = send(&app, req).await;
+    let authz_hash = body["hash"].as_str().unwrap();
+
+    // 创建 2 个回执
+    for i in 1..=2 {
+        let receipt_content = json!({
+            "receipt_id": format!("rct-q{}", i),
+            "executor_id": "baize-root",
+            "task_id": format!("task-q{}", i),
+            "action_type": "execute",
+            "intent_digest": intent_hash,
+            "authorization_digest": authz_hash,
+            "result_status": "SUCCEEDED",
+            "started_at": "2026-01-01T00:00:00Z",
+            "finished_at": "2026-01-01T00:01:00Z",
+        });
+        let req = post_json(
+            "/api/v1/receipts",
+            json!({"content": serde_json::to_string(&receipt_content).unwrap()}),
+            Some("baize-root"),
+        );
+        let (status, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // 按状态查询
+    let req = get_req("/api/v1/receipts?status=SUCCEEDED");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let receipts = body["receipts"].as_array().unwrap();
+    assert!(receipts.len() >= 2, "should find at least 2 receipts");
+
+    // 按 executor 查询
+    let req = get_req("/api/v1/receipts?executor=baize-root");
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["receipts"].as_array().unwrap().len() >= 2);
+}
+
+// ─── 补充测试：Session Close 存在性验证 ───
+
+#[tokio::test]
+async fn test_v1_session_close_not_found() {
+    let app = test_app();
+
+    // 尝试关闭不存在的 session
+    let req = post_json(
+        "/api/v1/sessions/nonexistent-session/close",
+        json!({"reason": "test"}),
+        Some("baize-root"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn test_v1_session_close_already_closed() {
+    let app = test_app();
+
+    // 注册 peers
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "close-peer-a", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "close-peer-b", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 创建 session-init（通过 blob write，与 test_v1_session_close 一致）
+    let init_content = json!({
+        "ephemeral_pub": "test-pub-dbl",
+        "cipher_suites": ["AES-256-GCM"],
+        "credential_digest": "sha256:test-cred-dbl",
+    });
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": serde_json::to_string(&init_content).unwrap(), "labels": {
+            "type": "session-init",
+            "x-session-id": "sess-dbl-close",
+            "x-session-peer-a": "close-peer-a",
+            "x-session-peer-b": "close-peer-b",
+        }}),
+        Some("close-peer-a"),
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 第一次关闭：成功
+    let req = post_json(
+        "/api/v1/sessions/sess-dbl-close/close",
+        json!({"reason": "first close"}),
+        Some("close-peer-a"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "first close failed: {:?}", body);
+
+    // 第二次关闭：冲突
+    let req = post_json(
+        "/api/v1/sessions/sess-dbl-close/close",
+        json!({"reason": "second close"}),
+        Some("close-peer-a"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap().contains("already closed"));
 }

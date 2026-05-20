@@ -59,6 +59,14 @@ impl WorkspaceManager {
         Ok(ws_path)
     }
 
+    /// 确保 workspace 存在：已存在则返回路径，否则创建
+    pub fn ensure(&mut self, agent_id: &str) -> Result<PathBuf> {
+        if let Some(path) = self.workspaces.get(agent_id) {
+            return Ok(path.clone());
+        }
+        self.create(agent_id)
+    }
+
     /// 销毁 Agent 工作目录
     pub fn destroy(&mut self, agent_id: &str) -> Result<()> {
         let ws_path = self.workspaces.remove(agent_id)

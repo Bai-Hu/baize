@@ -130,6 +130,7 @@ mod tests {
                 parent_id: None,
                 level: 2,
                 zones: vec!["A".to_string()],
+                status: baize_core::cert::CredentialStatus::Active,
             }),
             operation: "test".to_string(),
             scope: Some(scope),

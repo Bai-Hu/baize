@@ -361,6 +361,21 @@ impl Storage {
         Ok(labels)
     }
 
+    /// 查询指定 entity 的所有 labels
+    pub fn label_query_for_entity(&self, entity_hash: &str) -> Result<Vec<Label>> {
+        let mut stmt = self.db.prepare(
+            "SELECT entity_hash, key, value FROM labels WHERE entity_hash = ?1",
+        )?;
+        let result: Vec<Label> = stmt.query_map(params![entity_hash], |row| {
+            Ok(Label {
+                entity_hash: row.get(0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+            })
+        })?.filter_map(|r| r.ok()).collect();
+        Ok(result)
+    }
+
     // ─── 工具函数 ───
 
     pub fn hash_content(content: &str) -> String {

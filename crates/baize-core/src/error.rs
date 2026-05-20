@@ -23,6 +23,30 @@ pub enum Error {
     #[error("storage error: {0}")]
     Storage(String, #[source] Option<rusqlite::Error>),
 
+    #[error("channel closed: {0}")]
+    ChannelClosed(String),
+
+    #[error("constraint violation: {0}")]
+    ConstraintViolation(String),
+
+    #[error("chain broken: {0}")]
+    ChainBroken(String),
+
+    #[error("invalid signature: {0}")]
+    SignatureInvalid(String),
+
+    #[error("expired timestamp: {0}")]
+    ExpiredTimestamp(String),
+
+    #[error("credential expired: {0}")]
+    CredentialExpired(String),
+
+    #[error("intent expired: {0}")]
+    IntentExpired(String),
+
+    #[error("authorization expired: {0}")]
+    AuthorizationExpired(String),
+
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -68,5 +92,17 @@ mod tests {
             Error::Internal(err) => assert!(err.to_string().contains("something broke")),
             _ => panic!("expected Internal"),
         }
+    }
+
+    #[test]
+    fn v1_error_variants() {
+        assert!(format!("{}", Error::ChannelClosed("chan-1".into())).contains("chan-1"));
+        assert!(format!("{}", Error::ConstraintViolation("budget exceeded".into())).contains("budget exceeded"));
+        assert!(format!("{}", Error::ChainBroken("hash mismatch".into())).contains("hash mismatch"));
+        assert!(format!("{}", Error::SignatureInvalid("bad hmac".into())).contains("bad hmac"));
+        assert!(format!("{}", Error::ExpiredTimestamp("too old".into())).contains("too old"));
+        assert!(format!("{}", Error::CredentialExpired("agent-1".into())).contains("agent-1"));
+        assert!(format!("{}", Error::IntentExpired("intent-1".into())).contains("intent-1"));
+        assert!(format!("{}", Error::AuthorizationExpired("authz-1".into())).contains("authz-1"));
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "baize-asl"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+baize-core = { path = "../baize-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

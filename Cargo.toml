@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/baize-core",
+    "crates/baize-asl",
     "crates/baize-server",
     "crates/baize-cli",
     "crates/baize-middleware",
@@ -23,6 +24,13 @@ x509-parser = "0.16"
 # SHA-256
 sha2 = "0.10"
 pem = "3"
+
+# 加密
+aes-gcm = "0.10"
+base64 = "0.22"
+getrandom = "0.2"
+hmac = "0.12"
+hex = "0.4"
 
 # 序列化
 serde = { version = "1", features = ["derive"] }

@@ -5,10 +5,10 @@
 //!
 //! # 使用方式
 //!
-//! ```no_run
+//! ```ignore
 //! use baize_middleware::prelude::*;
 //!
-//! // 创建 HTTP 客户端
+//! // 创建 HTTP 客户端（需要启用 http feature）
 //! let client = BaizeHttpClient::new(
 //!     "http://127.0.0.1:3000/api/v0",
 //!     "my-agent",

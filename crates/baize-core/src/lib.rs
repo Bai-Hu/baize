@@ -1,5 +1,8 @@
 pub mod cert;
+pub mod constraint;
+pub mod crypto;
 pub mod error;
+pub mod labels;
 pub mod scope;
 pub mod storage;
 pub mod workspace;

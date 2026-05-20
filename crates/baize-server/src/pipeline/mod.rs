@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use baize_core::cert::{CertIdentity, CertTool};
+use baize_core::cert::{CertIdentity, CertTool, CredentialStatus};
 use baize_core::error::Error;
+use baize_core::labels::*;
 use baize_core::storage::Storage;
 use baize_core::workspace::WorkspaceManager;
 use baize_core::ROOT_AGENT_ID;
@@ -20,6 +21,7 @@ macro_rules! labels {
 
 // 子模块
 pub mod agent_manager;
+pub mod auth;
 pub mod auditor;
 pub mod data_ops;
 pub mod elevation;
@@ -43,13 +45,15 @@ pub struct Baize {
     pub(super) hooks: HookRegistry,
     /// agent_id → (CertIdentity, IssuerCtx)
     pub(super) agents: HashMap<String, (CertIdentity, baize_core::cert::IssuerCtx)>,
+    /// v1：ASL 合规上下文（适配 + 校验）
+    pub asl: baize_asl::AslContext,
 }
 
 impl Baize {
     /// 初始化白泽：创建存储 + 生成 Root CA
     pub fn init(db_path: &str, ws_base: &str, main_repo: &str) -> Result<Self, Error> {
         let storage = Storage::open(db_path)?;
-        let workspace_mgr = WorkspaceManager::new(ws_base)?;
+        let mut workspace_mgr = WorkspaceManager::new(ws_base)?;
 
         // 创建主仓库目录 + Git 初始化
         let main_repo_path = PathBuf::from(main_repo);
@@ -96,6 +100,9 @@ impl Baize {
             agents.insert(ROOT_AGENT_ID.to_string(), (root_bundle.identity, root_ctx));
         }
 
+        // 为 root 创建/恢复 workspace
+        workspace_mgr.ensure(ROOT_AGENT_ID)?;
+
         // 恢复所有已注册的 agent
         let mut agent_filter = HashMap::new();
         agent_filter.insert("type".to_string(), "agent-cert".to_string());
@@ -119,13 +126,36 @@ impl Baize {
 
             let identity = CertTool::parse_identity(&cert_blob.content)?;
 
+            // v1 恢复：从 agent-cert labels 重建 CredentialStatus
+            let status = Self::recover_credential_status(&storage, &cert_blob.hash);
+            let identity = CertIdentity { status, ..identity };
+
             let mut akey_filter = HashMap::new();
             akey_filter.insert("type".to_string(), "agent-key".to_string());
             akey_filter.insert("agent-id".to_string(), agent_id.clone());
             let agent_keys = storage.blob_query(&akey_filter)?;
 
-            if let Some(key_blob) = agent_keys.first() {
+            // 优先使用 IDN_SIGN 用途的 key 恢复 issuer context
+            let idn_sign_key = agent_keys.iter().find(|b| {
+                b.labels.get("x-key-purpose").map(|v| v.as_str()) == Some("IDN_SIGN")
+            }).or_else(|| agent_keys.first());
+
+            if let Some(key_blob) = idn_sign_key {
                 if let Ok(agent_ctx) = CertTool::recover_issuer(&cert_blob.content, &key_blob.content) {
+                    // 恢复 agent workspace
+                    if let Err(e) = workspace_mgr.ensure(&agent_id) {
+                        eprintln!("WARNING: skip agent {}: workspace ensure failed: {}", agent_id, e);
+                        continue;
+                    }
+                    agents.insert(agent_id, (identity, agent_ctx));
+                }
+            } else if let Some(key_blob) = agent_keys.first() {
+                // v0 兼容：没有 x-key-purpose label 的旧 key blob
+                if let Ok(agent_ctx) = CertTool::recover_issuer(&cert_blob.content, &key_blob.content) {
+                    if let Err(e) = workspace_mgr.ensure(&agent_id) {
+                        eprintln!("WARNING: skip agent {}: workspace ensure failed: {}", agent_id, e);
+                        continue;
+                    }
                     agents.insert(agent_id, (identity, agent_ctx));
                 }
             }
@@ -137,7 +167,25 @@ impl Baize {
             main_repo: main_repo_path,
             hooks: crate::hook::default_hooks(),
             agents,
+            asl: baize_asl::AslContext::default(),
         })
+    }
+
+    /// 从 agent-cert blob 的 labels 恢复凭证状态
+    /// 优先级：revoked > expired > suspended > active
+    fn recover_credential_status(storage: &Storage, cert_hash: &str) -> CredentialStatus {
+        let labels = storage.label_query_for_entity(cert_hash)
+            .unwrap_or_default();
+
+        if labels.iter().any(|l| l.key == LABEL_CERT_REVOKED && l.value == "true") {
+            CredentialStatus::Revoked
+        } else if labels.iter().any(|l| l.key == LABEL_CERT_EXPIRED && l.value == "true") {
+            CredentialStatus::Expired
+        } else if labels.iter().any(|l| l.key == LABEL_CERT_SUSPENDED && l.value == "true") {
+            CredentialStatus::Suspended
+        } else {
+            CredentialStatus::Active
+        }
     }
 
     /// 用内存数据库初始化（用于测试）
@@ -146,7 +194,7 @@ impl Baize {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_dir = std::env::temp_dir().join(format!("baize-test-{}-{}", std::process::id(), unique));
-        let workspace_mgr = WorkspaceManager::new(tmp_dir.to_str().unwrap_or(""))?;
+        let mut workspace_mgr = WorkspaceManager::new(tmp_dir.to_str().unwrap_or(""))?;
 
         let main_repo = tmp_dir.join("main");
         std::fs::create_dir_all(&main_repo)
@@ -157,12 +205,24 @@ impl Baize {
 
         let labels = labels! { "type" => "root-ca", "agent-id" => ROOT_AGENT_ID };
         storage.blob_write(&root_bundle.cert_pem, &labels)?;
-        let key_labels = labels! { "type" => "agent-key", "agent-id" => ROOT_AGENT_ID };
+        // root agent 密钥：兼容 init 路径（含 purpose labels 供签名 middleware 查询）
+        let key_labels = labels! {
+            "type" => "agent-key",
+            "agent-id" => ROOT_AGENT_ID,
+            LABEL_KEY_OWNER => ROOT_AGENT_ID,
+            LABEL_KEY_PURPOSE => "IDN_SIGN",
+            LABEL_KEY_ALGORITHM => "Ed25519",
+            LABEL_KEY_NONEXPORTABLE => "true",
+            LABEL_KEY_SEE_LEVEL => "L1",
+        };
         storage.blob_write(&root_bundle.key_pem, &key_labels)?;
 
         let root_identity = root_bundle.identity;
         let mut agents = HashMap::new();
         agents.insert(ROOT_AGENT_ID.to_string(), (root_identity, root_ctx));
+
+        // 为 root 创建 workspace
+        workspace_mgr.ensure(ROOT_AGENT_ID)?;
 
         Ok(Self {
             storage,
@@ -170,6 +230,7 @@ impl Baize {
             main_repo,
             hooks: crate::hook::default_hooks(),
             agents,
+            asl: baize_asl::AslContext::default(),
         })
     }
 }
