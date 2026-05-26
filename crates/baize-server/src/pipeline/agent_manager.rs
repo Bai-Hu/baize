@@ -53,6 +53,9 @@ pub trait PermissionGuard {
 
     /// Zone 检查：路径首段必须在 agent scope 内
     fn verify_file_zone(identity: &CertIdentity, path: &str) -> Result<(), Error>;
+
+    /// IDN-ATH：验证 agent 持有有效的运行态证明
+    fn require_valid_proof(&self, agent_id: &str) -> Result<baize_asl::payload::RuntimeProofContent, Error>;
 }
 
 impl AgentRegistry for Baize {
@@ -139,10 +142,13 @@ impl AgentRegistry for Baize {
         // 私钥使用 AES-256-GCM 加密存储（如有 master secret）
         let master_secret = baize_core::crypto::master_secret_from_env();
         for purpose in KEY_PURPOSES {
-            let key_pem = if purpose == &"IDN_SIGN" {
-                bundle.key_pem.clone()
+            let (key_pem, algorithm) = if purpose == &"IDN_SIGN" {
+                (bundle.key_pem.clone(), "Ed25519")
+            } else if purpose == &"SESSION" {
+                let (priv_pem, _) = baize_core::crypto::generate_x25519_keypair()?;
+                (priv_pem, "X25519")
             } else {
-                CertTool::generate_key_pair()?
+                (CertTool::generate_key_pair()?, "Ed25519")
             };
             let stored_key = if let Some(ref secret) = master_secret {
                 baize_core::crypto::encrypt_key(&key_pem, secret)?
@@ -154,7 +160,7 @@ impl AgentRegistry for Baize {
                 "agent-id" => name,
                 LABEL_KEY_OWNER => name,
                 LABEL_KEY_PURPOSE => purpose,
-                LABEL_KEY_ALGORITHM => "Ed25519",
+                LABEL_KEY_ALGORITHM => algorithm,
                 LABEL_KEY_NONEXPORTABLE => "true",
                 LABEL_KEY_SEE_LEVEL => "L1",
             };
@@ -193,6 +199,17 @@ impl AgentRegistry for Baize {
         let cert_blobs = self.storage.blob_query(&cert_filter)?;
         if let Some(cert_blob) = cert_blobs.first() {
             let _ = self.storage.label_add(&cert_blob.hash, "revoked", "true");
+        }
+
+        // INF-KMS：标记所有 agent-key blob 为已撤销（密钥销毁）
+        let mut key_filter = HashMap::new();
+        key_filter.insert("type".to_string(), "agent-key".to_string());
+        key_filter.insert("agent-id".to_string(), agent_id.to_string());
+        let key_blobs = self.storage.blob_query(&key_filter)?;
+        for key_blob in &key_blobs {
+            if !key_blob.labels.contains_key(LABEL_KEY_REVOKED) {
+                let _ = self.storage.label_set(&key_blob.hash, LABEL_KEY_REVOKED, "true");
+            }
         }
 
         // 移除 agent
@@ -292,6 +309,126 @@ impl AgentRegistry for Baize {
     }
 }
 
+/// INF-KMS 密钥管理接口
+pub trait KmsManager {
+    /// 按 purpose 获取 agent 的活跃密钥（解密后的 PEM）
+    fn kms_get_active_key(&self, agent_id: &str, purpose: &str) -> Result<String, Error>;
+
+    /// 轮换指定用途的密钥，返回新密钥 blob 的 hash
+    fn kms_rotate_key(&mut self, agent_id: &str, purpose: &str) -> Result<String, Error>;
+}
+
+impl KmsManager for Baize {
+    fn kms_get_active_key(&self, agent_id: &str, purpose: &str) -> Result<String, Error> {
+        let (identity, _) = self.agents.get(agent_id)
+            .ok_or_else(|| Error::NotFound(format!("agent {}", agent_id)))?;
+        if identity.status != CredentialStatus::Active {
+            return Err(Error::PermissionDenied(format!("agent {} is not active (status: {})", agent_id, identity.status)));
+        }
+
+        let mut filter = HashMap::new();
+        filter.insert("type".to_string(), "agent-key".to_string());
+        filter.insert(LABEL_KEY_OWNER.to_string(), agent_id.to_string());
+        filter.insert(LABEL_KEY_PURPOSE.to_string(), purpose.to_string());
+        let keys = self.storage.blob_query(&filter)?;
+
+        let active_key = keys.iter().find(|b| {
+            !b.labels.contains_key(LABEL_KEY_REVOKED)
+        }).ok_or_else(|| Error::NotFound(format!(
+            "no active key for agent {} purpose {}", agent_id, purpose
+        )))?;
+
+        let pem = if let Some(secret) = baize_core::crypto::master_secret_from_env() {
+            baize_core::crypto::decrypt_key(&active_key.content, &secret)?
+        } else {
+            active_key.content.clone()
+        };
+
+        Ok(pem)
+    }
+
+    fn kms_rotate_key(&mut self, agent_id: &str, purpose: &str) -> Result<String, Error> {
+        // 并发安全：Baize 实例由 tokio::sync::Mutex 保护（AppState = Arc<Mutex<Baize>>），
+        // 同一时间只有一个请求能进入此方法，不存在并发轮换的竞态条件。
+        // 如果未来引入多实例部署，需要在此处加分布式锁或数据库乐观锁。
+        if agent_id == ROOT_AGENT_ID {
+            return Err(Error::PermissionDenied("cannot rotate root keys".into()));
+        }
+        let (identity, _) = self.agents.get(agent_id)
+            .ok_or_else(|| Error::NotFound(format!("agent {}", agent_id)))?;
+        if identity.status != CredentialStatus::Active {
+            return Err(Error::PermissionDenied(
+                format!("agent {} is not active (status: {}), cannot rotate keys", agent_id, identity.status)
+            ));
+        }
+        if !KEY_PURPOSES.contains(&purpose) {
+            return Err(Error::Validation(format!("invalid key purpose: {}", purpose)));
+        }
+
+        let master_secret = baize_core::crypto::master_secret_from_env();
+
+        // 撤销当前活跃 key
+        let mut filter = HashMap::new();
+        filter.insert("type".to_string(), "agent-key".to_string());
+        filter.insert(LABEL_KEY_OWNER.to_string(), agent_id.to_string());
+        filter.insert(LABEL_KEY_PURPOSE.to_string(), purpose.to_string());
+        let existing_keys = self.storage.blob_query(&filter)?;
+
+        for old_key in &existing_keys {
+            if !old_key.labels.contains_key(LABEL_KEY_REVOKED) {
+                self.storage.label_set(&old_key.hash, LABEL_KEY_REVOKED, "true")?;
+            }
+        }
+
+        // 生成新 key
+        let (key_pem, algorithm) = if purpose == "SESSION" {
+            let (priv_pem, _) = baize_core::crypto::generate_x25519_keypair()?;
+            (priv_pem, "X25519")
+        } else {
+            (CertTool::generate_key_pair()?, "Ed25519")
+        };
+
+        // 加密并存储
+        let stored_key = if let Some(ref secret) = master_secret {
+            baize_core::crypto::encrypt_key(&key_pem, secret)?
+        } else {
+            key_pem.clone()
+        };
+
+        let key_labels = labels! {
+            "type" => "agent-key",
+            "agent-id" => agent_id,
+            LABEL_KEY_OWNER => agent_id,
+            LABEL_KEY_PURPOSE => purpose,
+            LABEL_KEY_ALGORITHM => algorithm,
+            LABEL_KEY_NONEXPORTABLE => "true",
+            LABEL_KEY_SEE_LEVEL => "L1",
+        };
+        let blob = self.storage.blob_write(&stored_key, &key_labels)?;
+
+        // IDN_SIGN 轮换时更新内存中 IssuerCtx
+        if purpose == "IDN_SIGN" {
+            let identity = self.agents.get(agent_id)
+                .map(|(id, _)| id.clone());
+            if let Some(identity) = identity {
+                let mut cert_filter = HashMap::new();
+                cert_filter.insert("type".to_string(), "agent-cert".to_string());
+                cert_filter.insert("agent-id".to_string(), agent_id.to_string());
+                let certs = self.storage.blob_query(&cert_filter)?;
+                if let Some(cert_blob) = certs.first() {
+                    if let Ok(new_ctx) = CertTool::recover_issuer(&cert_blob.content, &key_pem) {
+                        self.agents.insert(agent_id.to_string(), (identity, new_ctx));
+                    }
+                }
+            }
+        }
+
+        self.audit("key_rotate", agent_id, &format!("purpose={}", purpose), Some(agent_id))?;
+
+        Ok(blob.hash)
+    }
+}
+
 impl Baize {
     /// 凭证状态迁移校验（对齐 PROTOCOL_SPEC_V1 §7.3）
     /// Active → Suspended, Revoked, Expired
@@ -339,6 +476,20 @@ impl PermissionGuard for Baize {
             ));
         }
 
+        // v2: 凭证状态检查
+        match identity.status {
+            CredentialStatus::Active => {},
+            CredentialStatus::Suspended => return Err(Error::PermissionDenied(
+                format!("agent {} is suspended", agent_id)
+            )),
+            CredentialStatus::Revoked => return Err(Error::CredentialExpired(
+                format!("agent {} is revoked", agent_id)
+            )),
+            CredentialStatus::Expired => return Err(Error::CredentialExpired(
+                format!("agent {} is expired", agent_id)
+            )),
+        }
+
         Ok(identity.clone())
     }
 
@@ -347,6 +498,18 @@ impl PermissionGuard for Baize {
             .ok_or_else(|| Error::NeedUserDecision(
                 format!("agent '{}' not found. Register the agent first.", agent_id)
             ))?;
+
+        // v2: revoked/expired 不允许读取
+        match identity.status {
+            CredentialStatus::Active | CredentialStatus::Suspended => {},
+            CredentialStatus::Revoked => return Err(Error::CredentialExpired(
+                format!("agent {} is revoked", agent_id)
+            )),
+            CredentialStatus::Expired => return Err(Error::CredentialExpired(
+                format!("agent {} is expired", agent_id)
+            )),
+        }
+
         Ok(identity.clone())
     }
 
@@ -360,6 +523,141 @@ impl PermissionGuard for Baize {
             ));
         }
         Ok(())
+    }
+
+    fn require_valid_proof(&self, agent_id: &str) -> Result<baize_asl::payload::RuntimeProofContent, Error> {
+        // 1. 查找该 agent 所有 runtime-proof blob
+        let mut filter = HashMap::new();
+        filter.insert("type".to_string(), "runtime-proof".to_string());
+        filter.insert(LABEL_PROOF_AGENT.to_string(), agent_id.to_string());
+        let proofs = self.storage.blob_query(&filter)?;
+
+        if proofs.is_empty() {
+            return Err(Error::ProofRequired(
+                format!("agent {} has no runtime proof", agent_id)
+            ));
+        }
+
+        // 2. 找到最新的 proof（按 issued_at datetime 解析比较，解析失败视为最旧）
+        let mut latest_proof: Option<baize_asl::payload::RuntimeProofContent> = None;
+        let mut latest_issued_at: Option<chrono::DateTime<chrono::Utc>> = None;
+        for blob in &proofs {
+            if let Ok(proof) = serde_json::from_str::<baize_asl::payload::RuntimeProofContent>(&blob.content) {
+                let issued = chrono::DateTime::parse_from_rfc3339(&proof.issued_at)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .ok();
+                let is_newer = match (&latest_issued_at, &issued) {
+                    (Some(prev), Some(curr)) => curr > prev,
+                    (Some(_), None) => false, // 当前 proof 解析失败，不替换
+                    (None, _) => true,         // 尚无候选，取当前
+                };
+                if is_newer {
+                    latest_issued_at = issued;
+                    latest_proof = Some(proof);
+                }
+            }
+        }
+
+        let proof = latest_proof.ok_or_else(|| Error::ProofRequired(
+            format!("agent {} has no parseable runtime proof", agent_id)
+        ))?;
+
+        // 3. 检查未过期（fail-closed）
+        let expired = chrono::DateTime::parse_from_rfc3339(&proof.expires_at)
+            .map(|dt| dt < chrono::Utc::now())
+            .unwrap_or(true);
+        if expired {
+            return Err(Error::ProofRequired(
+                format!("agent {} runtime proof expired at {}", agent_id, proof.expires_at)
+            ));
+        }
+
+        // 4. 验证 credential_digest 匹配当前 agent-cert blob
+        let mut cert_filter = HashMap::new();
+        cert_filter.insert("type".to_string(), "agent-cert".to_string());
+        cert_filter.insert("agent-id".to_string(), agent_id.to_string());
+        let certs = self.storage.blob_query(&cert_filter)?;
+        let current_cert_hash = certs.first()
+            .map(|c| c.hash.clone())
+            .unwrap_or_default();
+
+        if proof.credential_digest != current_cert_hash {
+            return Err(Error::ProofRequired(
+                format!("agent {} proof credential_digest mismatch", agent_id)
+            ));
+        }
+
+        // 5. 验证 binding_context_digest 匹配重新计算的值
+        let cert_labels = certs.first()
+            .map(|c| c.labels.clone())
+            .unwrap_or_default();
+        let expected_digest = baize_asl::AslAdapter::compute_binding_context_digest(
+            &cert_labels,
+            &proof.instance_state_attributes,
+        );
+
+        if proof.binding_context_digest != expected_digest {
+            return Err(Error::ProofRequired(
+                format!("agent {} proof binding_context_digest mismatch", agent_id)
+            ));
+        }
+
+        Ok(proof)
+    }
+}
+
+impl Baize {
+    /// v2 Phase 1.3: 检查 agent 是否可访问指定 path 的 zone（含 elevation 授予的临时 zone）
+    pub(super) fn is_zone_accessible(
+        &self,
+        agent_id: &str,
+        identity: &CertIdentity,
+        path: &str,
+    ) -> Result<(), Error> {
+        // 1. 快速路径：agent 自身 zones 覆盖
+        if Self::verify_file_zone(identity, path).is_ok() {
+            return Ok(());
+        }
+
+        // 2. 查询当前有效的 elevation
+        let zone = path.split_once('/').map(|(z, _)| z).unwrap_or(path);
+
+        let mut filter = HashMap::new();
+        filter.insert("type".to_string(), "elevation-request".to_string());
+        filter.insert("elevation-agent".to_string(), agent_id.to_string());
+        filter.insert("elevation-approved".to_string(), "true".to_string());
+
+        let elevations = self.storage.blob_query(&filter)?;
+
+        for elev in &elevations {
+            // 跳过已归还/撤销的
+            if let Some(status) = elev.labels.get("elevation-status") {
+                if status == "Returned" || status == "Revoked" {
+                    continue;
+                }
+            }
+
+            // 跳过已过期的（解析失败视为已过期，fail-closed）
+            if let Some(expires) = elev.labels.get("elevation-expires") {
+                if super::is_timestamp_expired(expires) {
+                    continue;
+                }
+            }
+
+            // 检查 zone 是否在 elevation 授予的 zones 内
+            if let Some(zones_str) = elev.labels.get("elevation-zones") {
+                if let Ok(zones) = serde_json::from_str::<Vec<String>>(zones_str) {
+                    if zones.iter().any(|z| z == zone || z == "*") {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Err(Error::PermissionDenied(
+            format!("agent {} scope {:?} does not cover zone '{}' (no active elevation)",
+                agent_id, identity.zones, zone)
+        ))
     }
 }
 
@@ -402,7 +700,9 @@ mod v1_tests {
 
             let key = &keys[0];
             assert_eq!(key.labels.get(LABEL_KEY_OWNER).unwrap(), "purpose-agent");
-            assert_eq!(key.labels.get(LABEL_KEY_ALGORITHM).unwrap(), "Ed25519");
+            let expected_algo = if *purpose == "SESSION" { "X25519" } else { "Ed25519" };
+            assert_eq!(key.labels.get(LABEL_KEY_ALGORITHM).unwrap(), expected_algo,
+                "purpose {} should use {}", purpose, expected_algo);
             assert_eq!(key.labels.get(LABEL_KEY_NONEXPORTABLE).unwrap(), "true");
             assert_eq!(key.labels.get(LABEL_KEY_SEE_LEVEL).unwrap(), "L1");
         }
@@ -597,5 +897,316 @@ mod v1_tests {
         assert_eq!(chain[0].status, CredentialStatus::Active);
         assert_eq!(chain[1].status, CredentialStatus::Suspended);
         assert_eq!(chain[2].status, CredentialStatus::Active);
+    }
+
+    // ─── INF-KMS Phase 2 测试 ───
+
+    #[test]
+    fn key_rotation_creates_new_key() {
+        let mut baize = setup();
+        baize.agent_register("rot-agent", Level(2), vec!["A"], None).unwrap();
+
+        let old_hash = {
+            let mut f = HashMap::new();
+            f.insert("type".into(), "agent-key".into());
+            f.insert(LABEL_KEY_OWNER.into(), "rot-agent".into());
+            f.insert(LABEL_KEY_PURPOSE.into(), "IDN_SIGN".into());
+            let keys = baize.storage.blob_query(&f).unwrap();
+            keys[0].hash.clone()
+        };
+
+        let new_hash = baize.kms_rotate_key("rot-agent", "IDN_SIGN").unwrap();
+        assert_ne!(new_hash, old_hash, "rotation should produce a different key blob");
+    }
+
+    #[test]
+    fn key_rotation_revokes_old_key() {
+        let mut baize = setup();
+        baize.agent_register("rot-agent", Level(2), vec!["A"], None).unwrap();
+
+        baize.kms_rotate_key("rot-agent", "INT_SIGN").unwrap();
+
+        let mut f = HashMap::new();
+        f.insert("type".into(), "agent-key".into());
+        f.insert(LABEL_KEY_OWNER.into(), "rot-agent".into());
+        f.insert(LABEL_KEY_PURPOSE.into(), "INT_SIGN".into());
+        let keys = baize.storage.blob_query(&f).unwrap();
+        assert_eq!(keys.len(), 2, "should have old + new key");
+
+        let revoked = keys.iter().find(|k| k.labels.contains_key(LABEL_KEY_REVOKED)).unwrap();
+        assert_eq!(revoked.labels.get(LABEL_KEY_REVOKED).unwrap(), "true");
+
+        let active = keys.iter().find(|k| !k.labels.contains_key(LABEL_KEY_REVOKED)).unwrap();
+        assert!(active.labels.get(LABEL_KEY_REVOKED).is_none());
+    }
+
+    #[test]
+    fn key_rotation_idn_sign_updates_issuer_ctx() {
+        let mut baize = setup();
+        baize.agent_register("parent", Level(3), vec!["A", "B"], None).unwrap();
+
+        baize.kms_rotate_key("parent", "IDN_SIGN").unwrap();
+
+        // 轮换后 parent 应仍能签发子 agent
+        baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
+        assert!(baize.agents.contains_key("child"));
+    }
+
+    #[test]
+    fn rotate_root_fails() {
+        let mut baize = setup();
+        let result = baize.kms_rotate_key(ROOT_AGENT_ID, "IDN_SIGN");
+        assert!(result.is_err());
+        match result {
+            Err(Error::PermissionDenied(msg)) => assert!(msg.contains("root")),
+            other => panic!("expected PermissionDenied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rotate_nonexistent_agent_fails() {
+        let mut baize = setup();
+        let result = baize.kms_rotate_key("ghost", "IDN_SIGN");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rotate_invalid_purpose_fails() {
+        let mut baize = setup();
+        baize.agent_register("rot-agent", Level(2), vec!["A"], None).unwrap();
+        let result = baize.kms_rotate_key("rot-agent", "INVALID_PURPOSE");
+        assert!(result.is_err());
+        match result {
+            Err(Error::Validation(msg)) => assert!(msg.contains("invalid key purpose")),
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn revoke_destroys_all_keys() {
+        let mut baize = setup();
+        baize.agent_register("doomed", Level(2), vec!["A"], None).unwrap();
+        baize.agent_revoke("doomed").unwrap();
+
+        let mut f = HashMap::new();
+        f.insert("type".into(), "agent-key".into());
+        f.insert("agent-id".into(), "doomed".into());
+        let keys = baize.storage.blob_query(&f).unwrap();
+        assert_eq!(keys.len(), 5, "revoked agent should still have 5 key blobs");
+
+        for key in &keys {
+            assert!(key.labels.contains_key(LABEL_KEY_REVOKED),
+                "all keys should be revoked, but {:?} is not", key.hash);
+        }
+    }
+
+    #[test]
+    fn kms_get_active_key_excludes_revoked() {
+        let mut baize = setup();
+        baize.agent_register("key-agent", Level(2), vec!["A"], None).unwrap();
+
+        let old_key = baize.kms_get_active_key("key-agent", "IDN_SIGN").unwrap();
+        baize.kms_rotate_key("key-agent", "IDN_SIGN").unwrap();
+        let new_key = baize.kms_get_active_key("key-agent", "IDN_SIGN").unwrap();
+
+        assert_ne!(old_key, new_key, "active key should change after rotation");
+    }
+
+    #[test]
+    fn kms_get_active_key_no_revoked_returns_not_found() {
+        let mut baize = setup();
+        baize.agent_register("temp", Level(2), vec!["A"], None).unwrap();
+        baize.agent_revoke("temp").unwrap();
+
+        let result = baize.kms_get_active_key("temp", "IDN_SIGN");
+        assert!(result.is_err(), "revoked agent should have no active key");
+    }
+
+    // ─── Phase 4: IDN-ATH proof 验证测试 ───
+
+    /// 辅助：为 agent 生成一个合法的 runtime-proof blob
+    fn write_valid_proof(baize: &mut Baize, agent_id: &str) -> String {
+        let mut cert_filter = HashMap::new();
+        cert_filter.insert("type".to_string(), "agent-cert".to_string());
+        cert_filter.insert("agent-id".to_string(), agent_id.to_string());
+        let certs = baize.storage.blob_query(&cert_filter).unwrap();
+        let cert_hash = certs[0].hash.clone();
+        let cert_labels = certs[0].labels.clone();
+
+        let instance_state = serde_json::json!({"instance_id": agent_id, "instance_status": "running"});
+        let binding_digest = baize_asl::AslAdapter::compute_binding_context_digest(
+            &cert_labels, &instance_state,
+        );
+
+        let now = chrono::Utc::now();
+        let proof = baize_asl::payload::RuntimeProofContent {
+            proof_id: format!("proof-{}", now.timestamp_millis()),
+            credential_digest: cert_hash.clone(),
+            instance_state_attributes: instance_state,
+            binding_context_digest: binding_digest,
+            proof_anchor_mode: baize_asl::payload::ProofAnchorMode::CredentialAnchored,
+            issued_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::minutes(5)).to_rfc3339(),
+        };
+        let proof_labels = HashMap::from([
+            ("type".to_string(), "runtime-proof".to_string()),
+            (LABEL_PROOF_AGENT.to_string(), agent_id.to_string()),
+            (LABEL_PROOF_CREDENTIAL.to_string(), cert_hash.clone()),
+        ]);
+        baize.storage.blob_write(&serde_json::to_string(&proof).unwrap(), &proof_labels).unwrap();
+        cert_hash
+    }
+
+    #[test]
+    fn require_valid_proof_no_proof_fails() {
+        let mut baize = setup();
+        baize.agent_register("prover", Level(3), vec!["A"], None).unwrap();
+
+        let result = baize.require_valid_proof("prover");
+        assert!(result.is_err());
+        match result {
+            Err(Error::ProofRequired(msg)) => assert!(msg.contains("no runtime proof")),
+            other => panic!("expected ProofRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn require_valid_proof_expired_proof_fails() {
+        let mut baize = setup();
+        baize.agent_register("prover", Level(3), vec!["A"], None).unwrap();
+
+        // 写一个已过期的 proof
+        let mut cert_filter = HashMap::new();
+        cert_filter.insert("type".to_string(), "agent-cert".to_string());
+        cert_filter.insert("agent-id".to_string(), "prover".to_string());
+        let certs = baize.storage.blob_query(&cert_filter).unwrap();
+        let cert_hash = certs[0].hash.clone();
+        let cert_labels = certs[0].labels.clone();
+
+        let instance_state = serde_json::json!({"instance_id": "prover"});
+        let binding_digest = baize_asl::AslAdapter::compute_binding_context_digest(
+            &cert_labels, &instance_state,
+        );
+
+        let now = chrono::Utc::now();
+        let proof = baize_asl::payload::RuntimeProofContent {
+            proof_id: "proof-expired".to_string(),
+            credential_digest: cert_hash,
+            instance_state_attributes: instance_state,
+            binding_context_digest: binding_digest,
+            proof_anchor_mode: baize_asl::payload::ProofAnchorMode::CredentialAnchored,
+            issued_at: (now - chrono::Duration::minutes(10)).to_rfc3339(),
+            expires_at: (now - chrono::Duration::minutes(5)).to_rfc3339(),
+        };
+        let proof_labels = HashMap::from([
+            ("type".to_string(), "runtime-proof".to_string()),
+            (LABEL_PROOF_AGENT.to_string(), "prover".to_string()),
+            (LABEL_PROOF_CREDENTIAL.to_string(), proof.credential_digest.clone()),
+        ]);
+        baize.storage.blob_write(&serde_json::to_string(&proof).unwrap(), &proof_labels).unwrap();
+
+        let result = baize.require_valid_proof("prover");
+        assert!(result.is_err());
+        match result {
+            Err(Error::ProofRequired(msg)) => assert!(msg.contains("expired"), "got: {}", msg),
+            other => panic!("expected ProofRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn require_valid_proof_credential_mismatch_fails() {
+        let mut baize = setup();
+        baize.agent_register("prover", Level(3), vec!["A"], None).unwrap();
+
+        let mut cert_filter = HashMap::new();
+        cert_filter.insert("type".to_string(), "agent-cert".to_string());
+        cert_filter.insert("agent-id".to_string(), "prover".to_string());
+        let certs = baize.storage.blob_query(&cert_filter).unwrap();
+        let cert_labels = certs[0].labels.clone();
+
+        let instance_state = serde_json::json!({"instance_id": "prover"});
+        let binding_digest = baize_asl::AslAdapter::compute_binding_context_digest(
+            &cert_labels, &instance_state,
+        );
+
+        let now = chrono::Utc::now();
+        let proof = baize_asl::payload::RuntimeProofContent {
+            proof_id: "proof-mismatch".to_string(),
+            credential_digest: "sha256:wrong-cert-hash".to_string(), // 不匹配
+            instance_state_attributes: instance_state,
+            binding_context_digest: binding_digest,
+            proof_anchor_mode: baize_asl::payload::ProofAnchorMode::CredentialAnchored,
+            issued_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::minutes(5)).to_rfc3339(),
+        };
+        let proof_labels = HashMap::from([
+            ("type".to_string(), "runtime-proof".to_string()),
+            (LABEL_PROOF_AGENT.to_string(), "prover".to_string()),
+            (LABEL_PROOF_CREDENTIAL.to_string(), "sha256:wrong-cert-hash".to_string()),
+        ]);
+        baize.storage.blob_write(&serde_json::to_string(&proof).unwrap(), &proof_labels).unwrap();
+
+        let result = baize.require_valid_proof("prover");
+        assert!(result.is_err());
+        match result {
+            Err(Error::ProofRequired(msg)) => assert!(msg.contains("credential_digest mismatch"), "got: {}", msg),
+            other => panic!("expected ProofRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn require_valid_proof_valid_succeeds() {
+        let mut baize = setup();
+        baize.agent_register("prover", Level(3), vec!["A"], None).unwrap();
+
+        write_valid_proof(&mut baize, "prover");
+
+        let result = baize.require_valid_proof("prover");
+        assert!(result.is_ok(), "valid proof should succeed: {:?}", result);
+        assert!(result.unwrap().proof_id.contains("proof-"));
+    }
+
+    #[test]
+    fn require_valid_proof_selects_latest() {
+        let mut baize = setup();
+        baize.agent_register("prover", Level(3), vec!["A"], None).unwrap();
+
+        let mut cert_filter = HashMap::new();
+        cert_filter.insert("type".to_string(), "agent-cert".to_string());
+        cert_filter.insert("agent-id".to_string(), "prover".to_string());
+        let certs = baize.storage.blob_query(&cert_filter).unwrap();
+        let cert_hash = certs[0].hash.clone();
+        let cert_labels = certs[0].labels.clone();
+
+        let instance_state = serde_json::json!({"instance_id": "prover"});
+        let binding_digest = baize_asl::AslAdapter::compute_binding_context_digest(
+            &cert_labels, &instance_state,
+        );
+
+        // 先写一个过期的 proof
+        let now = chrono::Utc::now();
+        let old_proof = baize_asl::payload::RuntimeProofContent {
+            proof_id: "proof-old".to_string(),
+            credential_digest: cert_hash.clone(),
+            instance_state_attributes: instance_state.clone(),
+            binding_context_digest: binding_digest.clone(),
+            proof_anchor_mode: baize_asl::payload::ProofAnchorMode::CredentialAnchored,
+            issued_at: (now - chrono::Duration::minutes(10)).to_rfc3339(),
+            expires_at: (now - chrono::Duration::minutes(5)).to_rfc3339(),
+        };
+        let old_labels = HashMap::from([
+            ("type".to_string(), "runtime-proof".to_string()),
+            (LABEL_PROOF_AGENT.to_string(), "prover".to_string()),
+            (LABEL_PROOF_CREDENTIAL.to_string(), cert_hash.clone()),
+        ]);
+        baize.storage.blob_write(&serde_json::to_string(&old_proof).unwrap(), &old_labels).unwrap();
+
+        // 再写一个有效的 proof
+        write_valid_proof(&mut baize, "prover");
+
+        let result = baize.require_valid_proof("prover");
+        assert!(result.is_ok(), "should pick latest (valid) proof: {:?}", result);
+        let proof = result.unwrap();
+        assert_ne!(proof.proof_id, "proof-old", "should pick the newer proof");
     }
 }

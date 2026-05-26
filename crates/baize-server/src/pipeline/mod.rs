@@ -36,6 +36,14 @@ pub use elevation::ElevationManager;
 pub use file_sync::{FileSync, FileRecord, FileContent, PushResult, PullResult};
 pub use git_ops::{GitOps, GitCommitInfo, RepoStats};
 
+/// 判断 RFC3339 时间戳是否已过期（当前时间 > timestamp）
+/// 解析失败时视为已过期（fail-closed）
+pub(crate) fn is_timestamp_expired(timestamp: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|dt| dt < chrono::Utc::now())
+        .unwrap_or(true)
+}
+
 /// 白泽主控 — 五关口管道核心
 pub struct Baize {
     pub storage: Storage,
@@ -67,6 +75,7 @@ impl Baize {
         let existing_root = storage.blob_query(&root_filter)?;
 
         let mut agents = HashMap::new();
+        let master_secret = baize_core::crypto::master_secret_from_env();
 
         if !existing_root.is_empty() {
             // 已有 root CA：从存储恢复
@@ -80,7 +89,8 @@ impl Baize {
             let root_keys = storage.blob_query(&key_filter)?;
 
             if let Some(key_blob) = root_keys.first() {
-                let root_ctx = CertTool::recover_issuer(root_cert_pem, &key_blob.content)?;
+                let root_key_pem = Self::decrypt_key_content(&key_blob.content, &master_secret)?;
+                let root_ctx = CertTool::recover_issuer(root_cert_pem, &root_key_pem)?;
                 agents.insert(ROOT_AGENT_ID.to_string(), (root_identity, root_ctx));
             } else {
                 let (root_bundle, root_ctx) = CertTool::generate_root_ca()?;
@@ -141,22 +151,39 @@ impl Baize {
             }).or_else(|| agent_keys.first());
 
             if let Some(key_blob) = idn_sign_key {
-                if let Ok(agent_ctx) = CertTool::recover_issuer(&cert_blob.content, &key_blob.content) {
-                    // 恢复 agent workspace
-                    if let Err(e) = workspace_mgr.ensure(&agent_id) {
-                        eprintln!("WARNING: skip agent {}: workspace ensure failed: {}", agent_id, e);
+                let agent_key_pem = Self::decrypt_key_content(&key_blob.content, &master_secret);
+                match agent_key_pem {
+                    Ok(key_pem) => {
+                        if let Ok(agent_ctx) = CertTool::recover_issuer(&cert_blob.content, &key_pem) {
+                            if let Err(e) = workspace_mgr.ensure(&agent_id) {
+                                eprintln!("WARNING: skip agent {}: workspace ensure failed: {}", agent_id, e);
+                                continue;
+                            }
+                            agents.insert(agent_id, (identity, agent_ctx));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("WARNING: skip agent {}: key decryption failed: {}", agent_id, e);
                         continue;
                     }
-                    agents.insert(agent_id, (identity, agent_ctx));
                 }
             } else if let Some(key_blob) = agent_keys.first() {
                 // v0 兼容：没有 x-key-purpose label 的旧 key blob
-                if let Ok(agent_ctx) = CertTool::recover_issuer(&cert_blob.content, &key_blob.content) {
-                    if let Err(e) = workspace_mgr.ensure(&agent_id) {
-                        eprintln!("WARNING: skip agent {}: workspace ensure failed: {}", agent_id, e);
+                let agent_key_pem = Self::decrypt_key_content(&key_blob.content, &master_secret);
+                match agent_key_pem {
+                    Ok(key_pem) => {
+                        if let Ok(agent_ctx) = CertTool::recover_issuer(&cert_blob.content, &key_pem) {
+                            if let Err(e) = workspace_mgr.ensure(&agent_id) {
+                                eprintln!("WARNING: skip agent {}: workspace ensure failed: {}", agent_id, e);
+                                continue;
+                            }
+                            agents.insert(agent_id, (identity, agent_ctx));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("WARNING: skip agent {}: key decryption failed: {}", agent_id, e);
                         continue;
                     }
-                    agents.insert(agent_id, (identity, agent_ctx));
                 }
             }
         }
@@ -169,6 +196,14 @@ impl Baize {
             agents,
             asl: baize_asl::AslContext::default(),
         })
+    }
+
+    /// 解密 key blob content（如有 master secret）
+    fn decrypt_key_content(content: &str, master_secret: &Option<Vec<u8>>) -> Result<String, Error> {
+        match master_secret {
+            Some(secret) => baize_core::crypto::decrypt_key(content, secret),
+            None => Ok(content.to_string()),
+        }
     }
 
     /// 从 agent-cert blob 的 labels 恢复凭证状态

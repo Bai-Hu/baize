@@ -64,6 +64,11 @@ impl Auditor for Baize {
             labels.insert("x-audit-target".to_string(), t.to_string());
         }
 
+        // v2 Phase 1.4: 审计增强 — 记录 agent 凭证状态
+        if let Some((identity, _)) = self.agents.get(agent_id) {
+            labels.insert(LABEL_CERT_STATUS.to_string(), format!("{}", identity.status));
+        }
+
         // 5. 构造 content
         let mut content = serde_json::json!({
             "type": audit_type,

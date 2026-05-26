@@ -465,6 +465,22 @@ enum SessionAction {
     Read {
         session_id: String,
     },
+    /// 接受会话
+    Accept {
+        session_id: String,
+        #[arg(long)]
+        credential_digest_responder: String,
+        #[arg(long)]
+        ephemeral_pub: String,
+        #[arg(long, default_value = "AES-256-GCM")]
+        selected_cipher_suite: String,
+        #[arg(long)]
+        handshake_transcript_digest: String,
+        #[arg(long)]
+        expires_at: Option<String>,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
     /// 关闭 session
     Close {
         session_id: String,
@@ -1092,6 +1108,59 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         println!("会话 {} 未找到", session_id);
                     }
+                }
+                SessionAction::Accept {
+                    session_id,
+                    credential_digest_responder,
+                    ephemeral_pub,
+                    selected_cipher_suite,
+                    handshake_transcript_digest,
+                    expires_at,
+                    agent,
+                } => {
+                    let baize = open_baize()?;
+
+                    // 查找对应的 session-init blob
+                    let mut filter = HashMap::new();
+                    filter.insert("type".to_string(), "session-init".to_string());
+                    filter.insert("x-session-id".to_string(), session_id.clone());
+                    let init_blobs = baize.storage.blob_query(&filter)?;
+                    if init_blobs.is_empty() {
+                        anyhow::bail!("session {} not found", session_id);
+                    }
+                    let init_blob = &init_blobs[0];
+
+                    let now = chrono::Utc::now();
+                    let expires = expires_at.unwrap_or_else(|| {
+                        (now + chrono::Duration::minutes(30)).to_rfc3339()
+                    });
+
+                    let content = serde_json::json!({
+                        "session_id": session_id,
+                        "initiator": init_blob.labels.get("x-session-peer-a").unwrap_or(&String::new()),
+                        "responder": init_blob.labels.get("x-session-peer-b").unwrap_or(&String::new()),
+                        "credential_digest_responder": credential_digest_responder,
+                        "session_init_digest": init_blob.hash,
+                        "ephemeral_pub": ephemeral_pub,
+                        "selected_cipher_suite": selected_cipher_suite,
+                        "handshake_transcript_digest": handshake_transcript_digest,
+                        "established_at": now.to_rfc3339(),
+                        "expires_at": expires,
+                    }).to_string();
+
+                    let labels = HashMap::from([
+                        ("type".to_string(), "session-accept".to_string()),
+                        ("x-session-id".to_string(), session_id.clone()),
+                        ("x-session-peer-a".to_string(), init_blob.labels.get("x-session-peer-a").cloned().unwrap_or_default()),
+                        ("x-session-peer-b".to_string(), init_blob.labels.get("x-session-peer-b").cloned().unwrap_or_default()),
+                        ("x-session-status".to_string(), "active".to_string()),
+                        ("parent".to_string(), init_blob.hash.clone()),
+                    ]);
+                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    println!("会话接受成功:");
+                    println!("  Hash: {}", blob.hash);
+                    println!("  Session ID: {}", session_id);
+                    println!("  Status: active");
                 }
                 SessionAction::Close { session_id, reason, agent } => {
                     let baize = open_baize()?;

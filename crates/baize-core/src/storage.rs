@@ -271,6 +271,21 @@ impl Storage {
         Ok(count)
     }
 
+    /// 删除 blob 及其所有 labels
+    ///
+    /// Safety: 仅用于管道内部回滚（CNV/AZN-VER 校验失败时撤回刚写入的 blob）。
+    /// 调用方已在管道层完成鉴权，此函数不做权限检查。不得用于响应外部删除请求。
+    pub fn blob_delete(&self, hash: &str) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("DELETE FROM labels WHERE entity_hash = ?1", params![hash])?;
+        let rows = tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
+        tx.commit()?;
+        if rows == 0 {
+            return Err(Error::NotFound(format!("blob {}", hash)));
+        }
+        Ok(())
+    }
+
     fn blob_exists(&self, hash: &str) -> Result<bool> {
         let count: i64 = self.db.query_row(
             "SELECT COUNT(*) FROM blobs WHERE hash = ?1",
@@ -327,6 +342,25 @@ impl Storage {
             "INSERT INTO labels (entity_hash, key, value) VALUES (?1, ?2, ?3)",
             params![entity_hash, key, value],
         )?;
+        Ok(())
+    }
+
+    /// 设置 label（upsert：存在则替换，不存在则创建）
+    pub fn label_set(&self, entity_hash: &str, key: &str, value: &str) -> Result<()> {
+        if !self.blob_exists(entity_hash)? {
+            return Err(Error::NotFound(format!("blob {}", entity_hash)));
+        }
+        let tx = self.db.unchecked_transaction()?;
+        // 主键包含 value，必须先删除旧值再插入新值
+        tx.execute(
+            "DELETE FROM labels WHERE entity_hash = ?1 AND key = ?2",
+            params![entity_hash, key],
+        )?;
+        tx.execute(
+            "INSERT INTO labels (entity_hash, key, value) VALUES (?1, ?2, ?3)",
+            params![entity_hash, key, value],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -552,6 +586,41 @@ mod tests {
     fn label_add_nonexistent_entity() {
         let db = open_db();
         let result = db.label_add("deadbeef", "key", "val");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn label_set_creates_new() {
+        let db = open_db();
+        let blob = db.blob_write("data", &HashMap::new()).unwrap();
+        db.label_set(&blob.hash, "status", "active").unwrap();
+
+        let labels = db.label_query("status", Some("active")).unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].entity_hash, blob.hash);
+    }
+
+    #[test]
+    fn label_set_replaces_existing() {
+        let db = open_db();
+        let blob = db.blob_write("data", &HashMap::new()).unwrap();
+        db.label_add(&blob.hash, "status", "active").unwrap();
+
+        db.label_set(&blob.hash, "status", "revoked").unwrap();
+
+        // 旧值不应存在
+        let old = db.label_query("status", Some("active")).unwrap();
+        assert_eq!(old.len(), 0, "old value should be gone");
+        // 新值应存在
+        let new = db.label_query("status", Some("revoked")).unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].entity_hash, blob.hash);
+    }
+
+    #[test]
+    fn label_set_nonexistent_entity() {
+        let db = open_db();
+        let result = db.label_set("deadbeef", "key", "val");
         assert!(result.is_err());
     }
 

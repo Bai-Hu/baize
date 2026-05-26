@@ -16,6 +16,7 @@ use crate::pipeline::{
     Baize,
     AgentRegistry, ElevationManager, DataOps, FileSync, GitOps,
 };
+use crate::pipeline::agent_manager::PermissionGuard;
 use crate::pipeline::auditor::Auditor;
 use baize_core::labels::*;
 use baize_core::scope::{ElevationMode, Level};
@@ -56,6 +57,8 @@ fn map_error(e: baize_core::Error) -> axum::response::Response {
         baize_core::Error::CredentialExpired(_) => (StatusCode::GONE, "credential expired"),
         baize_core::Error::IntentExpired(_) => (StatusCode::GONE, "intent expired"),
         baize_core::Error::AuthorizationExpired(_) => (StatusCode::GONE, "authorization expired"),
+        baize_core::Error::KeyRotation(_) => (StatusCode::CONFLICT, "key rotation error"),
+        baize_core::Error::ProofRequired(_) => (StatusCode::FORBIDDEN, "proof required"),
     };
     error_response(status, msg)
 }
@@ -91,6 +94,11 @@ async fn v1_signature_middleware(
     req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
+    // v2 路径由 v2 中间件处理，跳过
+    if req.uri().path().starts_with("/api/v2") {
+        return next.run(req).await;
+    }
+
     let headers = req.headers();
     let has_sig = headers.get("x-signature").is_some() && headers.get("x-timestamp").is_some();
 
@@ -152,39 +160,74 @@ async fn v1_signature_middleware(
 /// 查找 IDN_SIGN 用途的 agent-key blob，解密后提取 HMAC 密钥。
 /// 若无专用密钥，回退到 agent-id 索引的通用密钥（root agent 兼容）。
 fn get_agent_signing_key(baize: &Baize, agent_id: &str) -> Result<Vec<u8>, String> {
-    // 优先查找 IDN_SIGN 用途密钥
-    let mut filter = std::collections::HashMap::new();
-    filter.insert("type".to_string(), "agent-key".to_string());
-    filter.insert(LABEL_KEY_OWNER.to_string(), agent_id.to_string());
-    filter.insert(LABEL_KEY_PURPOSE.to_string(), "IDN_SIGN".to_string());
-
-    let keys = baize.storage.blob_query(&filter).unwrap_or_default();
-
-    let key_content = if let Some(blob) = keys.first() {
-        blob.content.clone()
-    } else {
-        // 回退：查找 agent-id 索引的 IDN_SIGN 密钥（root agent）
-        let mut fallback = std::collections::HashMap::new();
-        fallback.insert("type".to_string(), "agent-key".to_string());
-        fallback.insert("agent-id".to_string(), agent_id.to_string());
-        fallback.insert(LABEL_KEY_PURPOSE.to_string(), "IDN_SIGN".to_string());
-        let fallback_keys = baize.storage.blob_query(&fallback).unwrap_or_default();
-        match fallback_keys.first() {
-            Some(blob) => blob.content.clone(),
-            None => return Err(format!("no signing key for agent {}", agent_id)),
-        }
-    };
-
-    // 尝试解密（如果有 master secret）
-    let pem = if let Some(secret) = baize_core::crypto::master_secret_from_env() {
-        baize_core::crypto::decrypt_key(&key_content, &secret)
-            .map_err(|e| format!("key decryption failed: {}", e))?
-    } else {
-        // 无 master secret → 明文存储
-        key_content
-    };
-
+    use crate::pipeline::agent_manager::KmsManager;
+    let pem = baize.kms_get_active_key(agent_id, "IDN_SIGN")
+        .map_err(|e| format!("no signing key for agent {}: {}", agent_id, e))?;
     Ok(crate::pipeline::auth::extract_signing_key(&pem))
+}
+
+// ─── v2 签名强制 middleware ───
+
+/// v2 请求签名验证 middleware
+///
+/// 与 v1 相同的签名验证逻辑，但**无签名时直接拒绝**（不 fallback）。
+/// 签名方案：HMAC-SHA256，密钥来源 INF-KMS IDN_SIGN 用途密钥。
+async fn v2_signature_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    // 只拦截 /api/v2 路径，其他路径直接放行
+    let path = req.uri().path().to_string();
+    if !path.starts_with("/api/v2") {
+        return next.run(req).await;
+    }
+
+    let headers = req.headers();
+
+    // v2 强制签名：三个头都必须存在
+    let agent_id = match headers.get("x-agent-id").and_then(|v| v.to_str().ok()) {
+        Some(id) => id.to_string(),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing x-agent-id header"),
+    };
+    let timestamp = match headers.get("x-timestamp").and_then(|v| v.to_str().ok()) {
+        Some(ts) => ts.to_string(),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing x-timestamp header"),
+    };
+    let signature = match headers.get("x-signature").and_then(|v| v.to_str().ok()) {
+        Some(sig) => sig.to_string(),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing x-signature header"),
+    };
+
+    let method = req.method().to_string();
+
+    // 消费 body 用于签名验证
+    let (parts, body) = req.into_parts();
+    let body_bytes = match http_body_util::BodyExt::collect(body).await {
+        Ok(collected) => collected.to_bytes().to_vec(),
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "failed to read request body"),
+    };
+    let body_str = String::from_utf8_lossy(&body_bytes).to_string();
+
+    // 获取 agent 签名密钥并验证
+    let baize = state.lock().await;
+    match get_agent_signing_key(&baize, &agent_id) {
+        Ok(key) => {
+            if let Err(e) = crate::pipeline::auth::verify_signature(
+                &key, &timestamp, &method, &path, &body_str, &signature,
+            ) {
+                return map_error(e);
+            }
+        }
+        Err(_) => {
+            return error_response(StatusCode::UNAUTHORIZED, "no signing key found for agent");
+        }
+    }
+    drop(baize);
+
+    // 重建请求
+    let new_req = Request::from_parts(parts, Body::from(body_bytes));
+    next.run(new_req).await
 }
 
 pub fn app(baize: Baize) -> Router {
@@ -262,6 +305,7 @@ pub fn app(baize: Baize) -> Router {
         .route("/api/v1/authorizations/{hash}/verify", post(v1_authorization_verify))
         .route("/api/v1/authorizations/{hash}", get(v1_authorization_read))
         .route("/api/v1/sessions", post(v1_session_create))
+        .route("/api/v1/sessions/{id}/accept", post(v1_session_accept))
         .route("/api/v1/sessions/{id}", get(v1_session_read))
         .route("/api/v1/sessions/{id}/close", post(v1_session_close))
         .route("/api/v1/cnv/verify", post(v1_cnv_verify))
@@ -270,9 +314,28 @@ pub fn app(baize: Baize) -> Router {
         .route("/api/v1/agents/{id}/status", get(v1_agent_status))
         .route("/api/v1/agents/{id}/status", put(v1_agent_update_status))
         .route("/api/v1/agents/{id}/proof", post(v1_agent_proof))
+        .route("/api/v1/agents/{id}/keys/rotate", post(v1_key_rotate))
 
         // v1 签名验证 middleware（仅对 /api/v1 生效）
         .layer(middleware::from_fn_with_state(state.clone(), v1_signature_middleware))
+
+        // ─── v2 路由（签名强制）───
+        .route("/api/v2/blobs", post(blob_write))
+        .route("/api/v2/files/{*path}", post(file_write))
+        .route("/api/v2/intents", post(v1_intent_create))
+        .route("/api/v2/intents/derive", post(v1_intent_derive))
+        .route("/api/v2/authorizations", post(v1_authorization_create))
+        .route("/api/v2/authorizations/delegate", post(v1_authorization_delegate))
+        .route("/api/v2/receipts", post(v1_receipt_create))
+        .route("/api/v2/sessions", post(v1_session_create))
+        .route("/api/v2/sessions/{id}/accept", post(v1_session_accept))
+        .route("/api/v2/sessions/{id}/close", post(v1_session_close))
+        .route("/api/v2/agents/{id}/keys/rotate", post(v1_key_rotate))
+        .route("/api/v2/agents/{id}/proof", post(v1_agent_proof))
+        .route("/api/v2/agents/{id}/proof/verify", get(v2_proof_verify))
+
+        // v2 签名强制 middleware
+        .layer(middleware::from_fn_with_state(state.clone(), v2_signature_middleware))
         .with_state(state)
 }
 
@@ -430,6 +493,16 @@ struct V1SessionCreateRequest {
     #[serde(default)]
     credential_digest_b: String,
     #[serde(default)]
+    handshake_transcript_digest: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct V1SessionAcceptRequest {
+    credential_digest_responder: String,
+    ephemeral_pub: String,
+    selected_cipher_suite: String,
     handshake_transcript_digest: String,
     #[serde(default)]
     expires_at: Option<String>,
@@ -1236,6 +1309,66 @@ async fn v1_session_create(
     }
 }
 
+// LNK：接受会话（session-accept blob）
+async fn v1_session_accept(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Path(id): Path<String>,
+    Json(req): Json<V1SessionAcceptRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+
+    // 查找对应的 session-init blob
+    let mut init_filter = std::collections::HashMap::new();
+    init_filter.insert("type".to_string(), "session-init".to_string());
+    init_filter.insert(LABEL_SESSION_ID.to_string(), id.clone());
+    let init_blobs = match baize.storage.blob_query(&init_filter) {
+        Ok(b) => b,
+        Err(e) => return map_error(e),
+    };
+
+    if init_blobs.is_empty() {
+        return error_response(StatusCode::NOT_FOUND, "session not found");
+    }
+
+    let init_blob = &init_blobs[0];
+    let now = chrono::Utc::now();
+    let expires_at = req.expires_at.unwrap_or_else(|| {
+        (now + chrono::Duration::minutes(30)).to_rfc3339()
+    });
+
+    let content = serde_json::json!({
+        "session_id": id,
+        "initiator": init_blob.labels.get(LABEL_SESSION_PEER_A).unwrap_or(&String::new()),
+        "responder": init_blob.labels.get(LABEL_SESSION_PEER_B).unwrap_or(&String::new()),
+        "credential_digest_responder": req.credential_digest_responder,
+        "session_init_digest": init_blob.hash,
+        "ephemeral_pub": req.ephemeral_pub,
+        "selected_cipher_suite": req.selected_cipher_suite,
+        "handshake_transcript_digest": req.handshake_transcript_digest,
+        "established_at": now.to_rfc3339(),
+        "expires_at": expires_at,
+    }).to_string();
+
+    let labels = std::collections::HashMap::from([
+        ("type".to_string(), "session-accept".to_string()),
+        (LABEL_SESSION_ID.to_string(), id.clone()),
+        (LABEL_SESSION_PEER_A.to_string(), init_blob.labels.get(LABEL_SESSION_PEER_A).cloned().unwrap_or_default()),
+        (LABEL_SESSION_PEER_B.to_string(), init_blob.labels.get(LABEL_SESSION_PEER_B).cloned().unwrap_or_default()),
+        (LABEL_SESSION_STATUS.to_string(), "active".to_string()),
+        ("parent".to_string(), init_blob.hash.clone()),
+    ]);
+
+    match baize.pipe_blob_write(&agent.0, &content, &labels) {
+        Ok(blob) => (StatusCode::CREATED, Json(serde_json::json!({
+            "hash": blob.hash,
+            "session_id": id,
+            "status": "active",
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
 // LNK：读取会话
 async fn v1_session_read(
     State(state): State<AppState>,
@@ -1484,14 +1617,14 @@ async fn v1_agent_proof(
             "instance_status": "running"
         }));
 
-    // binding_context_digest: agent-cert hash + timestamp 的摘要
-    let binding_input = format!("{}:{}", credential_digest, now.to_rfc3339());
-    let binding_digest = format!("sha256:{}", {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(binding_input.as_bytes());
-        hex::encode(hasher.finalize())
-    });
+    // Phase 4: 使用 3 组属性计算正确的 binding_context_digest
+    let cert_labels = certs.first()
+        .map(|c| c.labels.clone())
+        .unwrap_or_default();
+    let binding_digest = baize_asl::AslAdapter::compute_binding_context_digest(
+        &cert_labels,
+        &instance_attrs,
+    );
 
     let anchor_mode = match req.proof_anchor_mode.as_str() {
         "ENVIRONMENT_ANCHORED" => baize_asl::payload::ProofAnchorMode::EnvironmentAnchored,
@@ -1519,6 +1652,53 @@ async fn v1_agent_proof(
             "hash": blob.hash,
             "proof_id": proof_id,
             "expires_at": expires,
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// ─── INF-KMS 密钥轮换 ───
+
+#[derive(serde::Deserialize)]
+struct KeyRotateRequest {
+    purpose: String,
+}
+
+async fn v1_key_rotate(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Path(id): Path<String>,
+    Json(req): Json<KeyRotateRequest>,
+) -> axum::response::Response {
+    // 权限隔离：只有 agent 本人或 baize-root 可以轮换密钥
+    if agent.0 != id && agent.0 != baize_core::ROOT_AGENT_ID {
+        return error_response(StatusCode::FORBIDDEN, "only the agent itself or root can rotate keys");
+    }
+    let mut baize = state.lock().await;
+    use crate::pipeline::agent_manager::KmsManager;
+    match baize.kms_rotate_key(&id, &req.purpose) {
+        Ok(new_key_hash) => (StatusCode::OK, Json(serde_json::json!({
+            "agent_id": id,
+            "purpose": req.purpose,
+            "new_key_hash": new_key_hash,
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// ─── v2 新增 Handler ───
+
+// IDN-ATH：验证 agent 是否持有有效运行态证明
+async fn v2_proof_verify(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.require_valid_proof(&id) {
+        Ok(proof) => (StatusCode::OK, Json(serde_json::json!({
+            "valid": true,
+            "proof_id": proof.proof_id,
+            "expires_at": proof.expires_at,
         }))).into_response(),
         Err(e) => map_error(e),
     }

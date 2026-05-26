@@ -10,6 +10,7 @@ use super::auditor::Auditor;
 use super::agent_manager::PermissionGuard;
 
 /// 文件操作记录
+#[derive(Debug)]
 pub struct FileRecord {
     pub path: String,
     pub hash: String,
@@ -115,7 +116,7 @@ impl Baize {
                     let rel_str = rel.to_str()
                         .ok_or_else(|| Error::Internal(anyhow::anyhow!("invalid path encoding: {:?}", rel)))?;
 
-                    if Self::verify_file_zone(identity, rel_str).is_err() {
+                    if self.is_zone_accessible(agent_id, identity, rel_str).is_err() {
                         continue;
                     }
 
@@ -139,7 +140,13 @@ impl FileSync for Baize {
         file_labels: Option<HashMap<String, String>>,
     ) -> Result<FileRecord, Error> {
         let identity = self.verify_write_agent(agent_id)?;
-        Self::verify_file_zone(&identity, path)?;
+
+        // Phase 4: Level 3+ 文件写入需有效 proof（root 豁免）
+        if identity.level >= 3 && agent_id != baize_core::ROOT_AGENT_ID {
+            self.require_valid_proof(agent_id)?;
+        }
+
+        self.is_zone_accessible(agent_id, &identity, path)?;
 
         self.workspace_mgr.write_file(agent_id, path, content)?;
 
@@ -168,7 +175,14 @@ impl FileSync for Baize {
         path: &str,
     ) -> Result<FileContent, Error> {
         let identity = self.verify_read_agent(agent_id)?;
-        Self::verify_file_zone(&identity, path)?;
+
+        // 设计决策：读操作不需要 IDN-ATH proof。
+        // proof 的目的是证明"这个 agent 正在运行且凭证未被篡改"——写操作
+        // 会产生不可逆的副作用（blob、文件、推送），所以需要 proof；
+        // 读操作只返回数据快照，不改变系统状态，因此无需 proof。
+        // 凭证状态检查（revoked/expired/suspended）由 verify_read_agent 负责。
+
+        self.is_zone_accessible(agent_id, &identity, path)?;
 
         // Overlay read：workspace 优先 → 主仓库 fallback
         let content = match self.workspace_mgr.read_file(agent_id, path) {
@@ -204,7 +218,13 @@ impl FileSync for Baize {
         path: &str,
     ) -> Result<(), Error> {
         let identity = self.verify_write_agent(agent_id)?;
-        Self::verify_file_zone(&identity, path)?;
+
+        // Phase 4: Level 3+ 文件删除需有效 proof（root 豁免）
+        if identity.level >= 3 && agent_id != baize_core::ROOT_AGENT_ID {
+            self.require_valid_proof(agent_id)?;
+        }
+
+        self.is_zone_accessible(agent_id, &identity, path)?;
 
         let hash = self.workspace_mgr.file_hash(agent_id, path).ok();
         self.workspace_mgr.delete_file(agent_id, path)?;
@@ -244,12 +264,17 @@ impl FileSync for Baize {
     ) -> Result<PushResult, Error> {
         let identity = self.verify_write_agent(agent_id)?;
 
+        // Phase 4: Level 3+ push 需有效 proof（root 豁免）
+        if identity.level >= 3 && agent_id != baize_core::ROOT_AGENT_ID {
+            self.require_valid_proof(agent_id)?;
+        }
+
         let files = self.workspace_mgr.list_files(agent_id)?;
         if files.is_empty() {
             return Err(Error::Validation("workspace is empty, nothing to push".into()));
         }
         for path in &files {
-            Self::verify_file_zone(&identity, path)?;
+            self.is_zone_accessible(agent_id, &identity, path)?;
         }
 
         // 鉴权 blob

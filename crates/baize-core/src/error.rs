@@ -47,6 +47,12 @@ pub enum Error {
     #[error("authorization expired: {0}")]
     AuthorizationExpired(String),
 
+    #[error("key rotation error: {0}")]
+    KeyRotation(String),
+
+    #[error("proof required: {0}")]
+    ProofRequired(String),
+
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -104,5 +110,7 @@ mod tests {
         assert!(format!("{}", Error::CredentialExpired("agent-1".into())).contains("agent-1"));
         assert!(format!("{}", Error::IntentExpired("intent-1".into())).contains("intent-1"));
         assert!(format!("{}", Error::AuthorizationExpired("authz-1".into())).contains("authz-1"));
+        assert!(format!("{}", Error::KeyRotation("no active key".into())).contains("no active key"));
+        assert!(format!("{}", Error::ProofRequired("agent needs proof".into())).contains("agent needs proof"));
     }
 }

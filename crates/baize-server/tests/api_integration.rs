@@ -1,6 +1,9 @@
 use axum::body::Body;
 use baize_server::api;
 use baize_server::Baize;
+use baize_server::pipeline::AgentRegistry;
+use baize_core::labels::*;
+use baize_core::scope::Level;
 use http_body_util::BodyExt;
 use http::{Request, StatusCode};
 use serde_json::{json, Value};
@@ -26,6 +29,12 @@ async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) 
         .to_bytes();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap_or(json!(null));
     (status, body)
+}
+
+/// 辅助：生成合法 X25519 公钥 base64（用于 session 测试）
+fn gen_ephemeral_pub() -> String {
+    let (_, pub_pem) = baize_core::crypto::generate_x25519_keypair().unwrap();
+    pub_pem.lines().find(|l| !l.starts_with('-')).unwrap().to_string()
 }
 
 fn post_json(uri: &str, body: Value, agent_id: Option<&str>) -> Request<Body> {
@@ -1328,20 +1337,20 @@ async fn test_v1_session_close() {
 
     let req = post_json(
         "/api/v1/agents",
-        json!({"name": "peer-a", "level": 3, "zones": ["A"]}),
+        json!({"name": "peer-a", "level": 2, "zones": ["A"]}),
         Some("baize-root"),
     );
     send(&app, req).await;
     let req = post_json(
         "/api/v1/agents",
-        json!({"name": "peer-b", "level": 3, "zones": ["A"]}),
+        json!({"name": "peer-b", "level": 2, "zones": ["A"]}),
         Some("baize-root"),
     );
     send(&app, req).await;
 
     // 创建 session-init
     let init_content = json!({
-        "ephemeral_pub": "fake-pub-key-a",
+        "ephemeral_pub": gen_ephemeral_pub(),
         "cipher_suites": ["AES-256-GCM"],
         "credential_digest": "sha256:fake-cred-a",
     });
@@ -1360,8 +1369,8 @@ async fn test_v1_session_close() {
 
     // 创建 session-accept（关闭前需要完成握手）
     let accept_content = json!({
-        "ephemeral_pub": "fake-pub-key-b",
-        "selected_cipher": "AES-256-GCM",
+        "ephemeral_pub": gen_ephemeral_pub(),
+        "selected_cipher_suite": "AES-256-GCM",
     });
     let req = post_json(
         "/api/v1/blobs",
@@ -1394,13 +1403,13 @@ async fn test_v1_session_create_and_read() {
 
     let req = post_json(
         "/api/v1/agents",
-        json!({"name": "sess-peer-a", "level": 3, "zones": ["A"]}),
+        json!({"name": "sess-peer-a", "level": 2, "zones": ["A"]}),
         Some("baize-root"),
     );
     send(&app, req).await;
     let req = post_json(
         "/api/v1/agents",
-        json!({"name": "sess-peer-b", "level": 3, "zones": ["A"]}),
+        json!({"name": "sess-peer-b", "level": 2, "zones": ["A"]}),
         Some("baize-root"),
     );
     send(&app, req).await;
@@ -1412,7 +1421,7 @@ async fn test_v1_session_create_and_read() {
             "session_id": "sess-api-test",
             "peer_a": "sess-peer-a",
             "peer_b": "sess-peer-b",
-            "ephemeral_pub": "test-pub-key",
+            "ephemeral_pub": gen_ephemeral_pub(),
             "cipher_suites": ["AES-256-GCM"],
             "credential_digest": "sha256:test-cred",
         }),
@@ -1918,20 +1927,20 @@ async fn test_v1_session_close_already_closed() {
     // 注册 peers
     let req = post_json(
         "/api/v1/agents",
-        json!({"name": "close-peer-a", "level": 3, "zones": ["A"]}),
+        json!({"name": "close-peer-a", "level": 2, "zones": ["A"]}),
         Some("baize-root"),
     );
     send(&app, req).await;
     let req = post_json(
         "/api/v1/agents",
-        json!({"name": "close-peer-b", "level": 3, "zones": ["A"]}),
+        json!({"name": "close-peer-b", "level": 2, "zones": ["A"]}),
         Some("baize-root"),
     );
     send(&app, req).await;
 
     // 创建 session-init（通过 blob write，与 test_v1_session_close 一致）
     let init_content = json!({
-        "ephemeral_pub": "test-pub-dbl",
+        "ephemeral_pub": gen_ephemeral_pub(),
         "cipher_suites": ["AES-256-GCM"],
         "credential_digest": "sha256:test-cred-dbl",
     });
@@ -1966,4 +1975,591 @@ async fn test_v1_session_close_already_closed() {
     let (status, body) = send(&app, req).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body["error"].as_str().unwrap().contains("already closed"));
+}
+
+// ─── Session Accept 端点测试 ───
+
+#[tokio::test]
+async fn test_v1_session_accept() {
+    let app = test_app();
+
+    // 注册两个 agent
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "accept-a", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "accept-b", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 创建 session-init
+    let req = post_json(
+        "/api/v1/sessions",
+        json!({
+            "session_id": "sess-accept-test",
+            "peer_a": "accept-a",
+            "peer_b": "accept-b",
+            "ephemeral_pub": gen_ephemeral_pub(),
+            "cipher_suites": ["AES-256-GCM"],
+        }),
+        Some("accept-a"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "session create failed: {:?}", body);
+
+    // 接受会话
+    let req = post_json(
+        "/api/v1/sessions/sess-accept-test/accept",
+        json!({
+            "credential_digest_responder": "sha256:responder-cred",
+            "ephemeral_pub": gen_ephemeral_pub(),
+            "selected_cipher_suite": "AES-256-GCM",
+            "handshake_transcript_digest": "sha256:handshake",
+        }),
+        Some("accept-b"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "session accept failed: {:?}", body);
+    assert_eq!(body["session_id"], "sess-accept-test");
+    assert_eq!(body["status"], "active");
+}
+
+#[tokio::test]
+async fn test_v1_session_accept_not_found() {
+    let app = test_app();
+
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "accept-nf-a", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 尝试接受不存在的 session
+    let req = post_json(
+        "/api/v1/sessions/nonexistent-session/accept",
+        json!({
+            "credential_digest_responder": "sha256:cred",
+            "ephemeral_pub": gen_ephemeral_pub(),
+            "selected_cipher_suite": "AES-256-GCM",
+            "handshake_transcript_digest": "sha256:handshake",
+        }),
+        Some("accept-nf-a"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_v1_session_accept_duplicate() {
+    let app = test_app();
+
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "accept-dup-a", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "accept-dup-b", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 创建 session-init
+    let req = post_json(
+        "/api/v1/sessions",
+        json!({
+            "session_id": "sess-dup-accept",
+            "peer_a": "accept-dup-a",
+            "peer_b": "accept-dup-b",
+            "ephemeral_pub": gen_ephemeral_pub(),
+            "cipher_suites": ["AES-256-GCM"],
+        }),
+        Some("accept-dup-a"),
+    );
+    send(&app, req).await;
+
+    // 第一次 accept
+    let req = post_json(
+        "/api/v1/sessions/sess-dup-accept/accept",
+        json!({"credential_digest_responder": "sha256:cred", "ephemeral_pub": gen_ephemeral_pub(), "selected_cipher_suite": "AES-256-GCM", "handshake_transcript_digest": "sha256:handshake"}),
+        Some("accept-dup-b"),
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 第二次 accept：冲突
+    let req = post_json(
+        "/api/v1/sessions/sess-dup-accept/accept",
+        json!({"credential_digest_responder": "sha256:cred2", "ephemeral_pub": gen_ephemeral_pub(), "selected_cipher_suite": "AES-256-GCM", "handshake_transcript_digest": "sha256:handshake2"}),
+        Some("accept-dup-b"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CONFLICT, "expected CONFLICT, got {:?}: {:?}", status, body);
+    assert_eq!(body["error"], "conflict");
+}
+
+// ─── Phase 4: Level 3+ Proof Enforcement 集成测试 ───
+
+/// 辅助：注册 Level 3 agent 并生成合法 proof
+async fn setup_l3_agent_with_proof(app: &axum::Router, agent_name: &str) {
+    // 注册 Level 3 agent
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": agent_name, "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(app, req).await;
+
+    // 生成 runtime proof（由 root 代为签发）
+    let req = post_json(
+        &format!("/api/v1/agents/{}/proof", agent_name),
+        json!({"instance_state_attributes": {"instance_id": agent_name, "instance_status": "running"}}),
+        Some("baize-root"),
+    );
+    let (status, body) = send(app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "proof generation failed: {:?}", body);
+}
+
+#[tokio::test]
+async fn test_l3_authz_without_proof_rejected() {
+    let app = test_app();
+
+    // 注册 Level 3 agent（无 proof）
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "l3-no-proof", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 写 intent（Level 3 agent 不需要 proof 的 blob type，先创建依赖）
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": serde_json::json!({
+            "intent_id": "int-l3-no-proof",
+            "intent_constraints": {"budget": 100},
+            "created_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2099-12-31T23:59:59Z",
+        }).to_string(), "labels": {
+            "type": "intent",
+            "x-intent-id": "int-l3-no-proof",
+            "x-intent-status": "active",
+            "x-intent-expires": "2099-12-31T23:59:59Z",
+        }}),
+        Some("l3-no-proof"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "intent write failed: {:?}", body);
+
+    // 尝试写 authorization（需 proof 的 blob type）→ 应被拒
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": serde_json::json!({
+            "authorization_id": "authz-no-proof",
+            "issuer": "baize-root",
+            "subject": "l3-no-proof",
+            "grant_type": "execute",
+            "constraints": {"target_scope": ["zone-A"]},
+            "delegatable": false,
+            "source_intent_digest": body["hash"],
+            "root_authorizer": "baize-root",
+            "nbf": "2026-01-01T00:00:00Z",
+            "exp": "2099-12-31T23:59:59Z",
+            "iat": "2026-01-01T00:00:00Z",
+            "jti": "jti-no-proof",
+            "version": "1.0",
+        }).to_string(), "labels": {
+            "type": "authorization",
+            "x-authz-status": "valid",
+        }}),
+        Some("l3-no-proof"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "Level 3 authz without proof should be FORBIDDEN, got {:?}: {:?}", status, body);
+    assert!(body["error"].as_str().unwrap().contains("proof"));
+}
+
+#[tokio::test]
+async fn test_l3_authz_with_proof_accepted() {
+    let app = test_app();
+
+    setup_l3_agent_with_proof(&app, "l3-with-proof").await;
+
+    // 写 intent
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": serde_json::json!({
+            "intent_id": "int-l3-proof",
+            "intent_constraints": {"budget": 100},
+            "created_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2099-12-31T23:59:59Z",
+        }).to_string(), "labels": {
+            "type": "intent",
+            "x-intent-id": "int-l3-proof",
+            "x-intent-status": "active",
+            "x-intent-expires": "2099-12-31T23:59:59Z",
+        }}),
+        Some("l3-with-proof"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "intent write failed: {:?}", body);
+    let intent_hash = body["hash"].as_str().unwrap();
+
+    // 写 authorization（Level 3 + 有 proof）→ 应成功
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": serde_json::json!({
+            "authorization_id": "authz-with-proof",
+            "issuer": "baize-root",
+            "subject": "l3-with-proof",
+            "grant_type": "execute",
+            "constraints": {"target_scope": ["zone-A"]},
+            "delegatable": false,
+            "source_intent_digest": intent_hash,
+            "root_authorizer": "baize-root",
+            "nbf": "2026-01-01T00:00:00Z",
+            "exp": "2099-12-31T23:59:59Z",
+            "iat": "2026-01-01T00:00:00Z",
+            "jti": "jti-with-proof",
+            "version": "1.0",
+        }).to_string(), "labels": {
+            "type": "authorization",
+            "x-authz-status": "valid",
+            "x-source-intent": intent_hash,
+        }}),
+        Some("l3-with-proof"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "Level 3 authz with valid proof should succeed, got {:?}: {:?}", status, body);
+}
+
+#[tokio::test]
+async fn test_l3_file_write_without_proof_rejected() {
+    let app = test_app();
+
+    // 注册 Level 3 agent（无 proof）
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "l3-file-no-proof", "level": 3, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 尝试写文件 → 应被拒
+    let req = post_json(
+        "/api/v0/files/A/test.txt",
+        json!({"content": "secret data"}),
+        Some("l3-file-no-proof"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "Level 3 file write without proof should be FORBIDDEN, got {:?}: {:?}", status, body);
+}
+
+#[tokio::test]
+async fn test_l3_file_write_with_proof_accepted() {
+    let app = test_app();
+
+    setup_l3_agent_with_proof(&app, "l3-file-proof").await;
+
+    // 写文件（有 proof）→ 应成功
+    let req = post_json(
+        "/api/v0/files/A/test.txt",
+        json!({"content": "secret data"}),
+        Some("l3-file-proof"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "Level 3 file write with proof should succeed, got {:?}: {:?}", status, body);
+    assert_eq!(body["path"], "A/test.txt");
+}
+
+#[tokio::test]
+async fn test_l2_authz_without_proof_accepted() {
+    let app = test_app();
+
+    // 注册 Level 2 agent
+    let req = post_json(
+        "/api/v1/agents",
+        json!({"name": "l2-no-proof", "level": 2, "zones": ["A"]}),
+        Some("baize-root"),
+    );
+    send(&app, req).await;
+
+    // 写 intent
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": serde_json::json!({
+            "intent_id": "int-l2",
+            "intent_constraints": {"budget": 100},
+            "created_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2099-12-31T23:59:59Z",
+        }).to_string(), "labels": {
+            "type": "intent",
+            "x-intent-id": "int-l2",
+            "x-intent-status": "active",
+            "x-intent-expires": "2099-12-31T23:59:59Z",
+        }}),
+        Some("l2-no-proof"),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "intent write failed: {:?}", body);
+    let intent_hash = body["hash"].as_str().unwrap();
+
+    // Level 2 写 authorization 无需 proof → 应成功
+    let req = post_json(
+        "/api/v1/blobs",
+        json!({"content": serde_json::json!({
+            "authorization_id": "authz-l2",
+            "issuer": "baize-root",
+            "subject": "l2-no-proof",
+            "grant_type": "execute",
+            "constraints": {"target_scope": ["zone-A"]},
+            "delegatable": false,
+            "source_intent_digest": intent_hash,
+            "root_authorizer": "baize-root",
+            "nbf": "2026-01-01T00:00:00Z",
+            "exp": "2099-12-31T23:59:59Z",
+            "iat": "2026-01-01T00:00:00Z",
+            "jti": "jti-l2",
+            "version": "1.0",
+        }).to_string(), "labels": {
+            "type": "authorization",
+            "x-authz-status": "valid",
+            "x-source-intent": intent_hash,
+        }}),
+        Some("l2-no-proof"),
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "Level 2 authz without proof should succeed");
+}
+
+// ─── Phase 5: v2 签名强制集成测试 ───
+
+/// 辅助：从 agent-key blob 获取签名密钥（SHA-256 of PEM）
+fn get_signing_key_for_agent(baize: &Baize, agent_id: &str) -> Vec<u8> {
+    use baize_core::labels::*;
+    let mut filter = std::collections::HashMap::new();
+    filter.insert("type".to_string(), "agent-key".to_string());
+    filter.insert(LABEL_KEY_OWNER.to_string(), agent_id.to_string());
+    filter.insert(LABEL_KEY_PURPOSE.to_string(), "IDN_SIGN".to_string());
+    let keys = baize.storage.blob_query(&filter).unwrap();
+
+    let key_content = if let Some(key_blob) = keys.iter().find(|b| !b.labels.contains_key(LABEL_KEY_REVOKED)) {
+        key_blob.content.clone()
+    } else {
+        keys[0].content.clone()
+    };
+
+    // 解密（如有 master secret）
+    let pem = if let Some(secret) = baize_core::crypto::master_secret_from_env() {
+        baize_core::crypto::decrypt_key(&key_content, &secret).unwrap()
+    } else {
+        key_content
+    };
+
+    // SHA-256 of PEM → HMAC key
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(pem.as_bytes());
+    hasher.finalize().to_vec()
+}
+
+/// 辅助：计算 HMAC-SHA256 签名
+fn compute_hmac_signature(key: &[u8], timestamp: &str, method: &str, path: &str, body: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let input = format!("{}\n{}\n{}\n{}", timestamp, method, path, body);
+    let mut mac = HmacSha256::new_from_slice(key).unwrap();
+    mac.update(input.as_bytes());
+    let result = mac.finalize();
+    format!("hmac-sha256:{}", hex::encode(result.into_bytes()))
+}
+
+/// 辅助：构造带签名的 v2 POST 请求
+fn v2_signed_post(
+    uri: &str,
+    body: &Value,
+    agent_id: &str,
+    signing_key: &[u8],
+) -> Request<Body> {
+    let body_str = serde_json::to_string(body).unwrap();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let signature = compute_hmac_signature(signing_key, &timestamp, "POST", uri, &body_str);
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-agent-id", agent_id)
+        .header("x-timestamp", timestamp)
+        .header("x-signature", signature)
+        .body(Body::from(body_str))
+        .unwrap()
+}
+
+/// 辅助：构造带签名的 v2 GET 请求
+fn v2_signed_get(
+    uri: &str,
+    agent_id: &str,
+    signing_key: &[u8],
+) -> Request<Body> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let signature = compute_hmac_signature(signing_key, &timestamp, "GET", uri, "");
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("x-agent-id", agent_id)
+        .header("x-timestamp", timestamp)
+        .header("x-signature", signature)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// 辅助：构造无签名的 v2 POST 请求
+fn v2_unsigned_post(uri: &str, body: &Value, agent_id: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-agent-id", agent_id)
+        .body(Body::from(serde_json::to_string(body).unwrap()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_v2_unsigned_request_rejected() {
+    let app = test_app();
+
+    // 无签名头的 v2 请求 → 401
+    let req = v2_unsigned_post(
+        "/api/v2/blobs",
+        &json!({"content": "test", "labels": {}}),
+        "baize-root",
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "unsigned v2 request should be rejected: {:?}", body);
+    assert!(body["error"].as_str().unwrap().contains("missing"));
+}
+
+#[tokio::test]
+async fn test_v2_invalid_signature_rejected() {
+    let app = test_app();
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let body_str = serde_json::to_string(&json!({"content": "test", "labels": {}})).unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v2/blobs")
+        .header("content-type", "application/json")
+        .header("x-agent-id", "baize-root")
+        .header("x-timestamp", &timestamp)
+        .header("x-signature", "hmac-sha256:deadbeef")
+        .body(Body::from(body_str))
+        .unwrap();
+
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "invalid signature should be rejected");
+}
+
+#[tokio::test]
+async fn test_v2_valid_signature_accepted() {
+    let mut baize = Baize::init_in_memory().unwrap();
+    baize.agent_register("sig-tester", Level(2), vec!["A"], None).unwrap();
+    let signing_key = get_signing_key_for_agent(&baize, "sig-tester");
+    let app = api::app(baize);
+
+    // 带有效签名的 v2 blob write → 成功
+    let req = v2_signed_post(
+        "/api/v2/blobs",
+        &json!({"content": "signed data", "labels": {}}),
+        "sig-tester",
+        &signing_key,
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "valid signed v2 request should succeed: {:?}", body);
+    assert!(!body["hash"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_v2_expired_timestamp_rejected() {
+    let mut baize = Baize::init_in_memory().unwrap();
+    baize.agent_register("ts-tester", Level(2), vec!["A"], None).unwrap();
+    let signing_key = get_signing_key_for_agent(&baize, "ts-tester");
+    let app = api::app(baize);
+
+    // 10 分钟前的时间戳 → 超出 5 分钟窗口
+    let past = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+    let body_str = serde_json::to_string(&json!({"content": "expired ts", "labels": {}})).unwrap();
+    let signature = compute_hmac_signature(&signing_key, &past, "POST", "/api/v2/blobs", &body_str);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v2/blobs")
+        .header("content-type", "application/json")
+        .header("x-agent-id", "ts-tester")
+        .header("x-timestamp", &past)
+        .header("x-signature", &signature)
+        .body(Body::from(body_str))
+        .unwrap();
+
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "expired timestamp should be rejected");
+}
+
+#[tokio::test]
+async fn test_v2_proof_verify_endpoint() {
+    let mut baize = Baize::init_in_memory().unwrap();
+    baize.agent_register("verify-target", Level(3), vec!["A"], None).unwrap();
+
+    // 先生成 proof
+    let cert_filter = {
+        use baize_core::labels::*;
+        let mut f = std::collections::HashMap::new();
+        f.insert("type".to_string(), "agent-cert".to_string());
+        f.insert("agent-id".to_string(), "verify-target".to_string());
+        f
+    };
+    let certs = baize.storage.blob_query(&cert_filter).unwrap();
+    let cert_hash = certs[0].hash.clone();
+    let cert_labels = certs[0].labels.clone();
+
+    let instance_state = serde_json::json!({"instance_id": "verify-target", "instance_status": "running"});
+    let binding_digest = baize_asl::AslAdapter::compute_binding_context_digest(&cert_labels, &instance_state);
+    let now = chrono::Utc::now();
+    let proof = baize_asl::payload::RuntimeProofContent {
+        proof_id: format!("proof-{}", now.timestamp_millis()),
+        credential_digest: cert_hash,
+        instance_state_attributes: instance_state,
+        binding_context_digest: binding_digest,
+        proof_anchor_mode: baize_asl::payload::ProofAnchorMode::CredentialAnchored,
+        issued_at: now.to_rfc3339(),
+        expires_at: (now + chrono::Duration::minutes(5)).to_rfc3339(),
+    };
+    let proof_labels = std::collections::HashMap::from([
+        ("type".to_string(), "runtime-proof".to_string()),
+        (LABEL_PROOF_AGENT.to_string(), "verify-target".to_string()),
+        (LABEL_PROOF_CREDENTIAL.to_string(), proof.credential_digest.clone()),
+    ]);
+    baize.storage.blob_write(&serde_json::to_string(&proof).unwrap(), &proof_labels).unwrap();
+
+    let signing_key = get_signing_key_for_agent(&baize, "baize-root");
+    let app = api::app(baize);
+
+    // v2 proof verify 端点 — 需要签名
+    let req = v2_signed_get(
+        "/api/v2/agents/verify-target/proof/verify",
+        "baize-root",
+        &signing_key,
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK, "proof verify should succeed: {:?}", body);
+    assert_eq!(body["valid"], true);
+    assert!(body["proof_id"].as_str().unwrap().starts_with("proof-"));
 }
