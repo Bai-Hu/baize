@@ -175,13 +175,13 @@ impl ElevationManager for Baize {
 
         // 检查是否已审批
         if blob.labels.contains_key("elevation-approved") {
-            return Err(Error::Validation("request already approved".into()));
+            return Err(Error::Conflict("request already approved".into()));
         }
 
         // 检查是否已归还/撤销
         if let Some(status) = blob.labels.get("elevation-status") {
             if status == "Returned" || status == "Revoked" {
-                return Err(Error::Validation(
+                return Err(Error::Conflict(
                     format!("request is {}, cannot approve", status)
                 ));
             }
