@@ -2,21 +2,27 @@
 //!
 //! v1 扩展：按 blob type label 分派校验逻辑（INT/AZN/LNK）
 
+pub(crate) mod intent_ops;
+pub(crate) mod authz_ops;
+pub(crate) mod session_ops;
+
 use std::collections::HashMap;
 
-use baize_core::constraint::{verify_authz_constraint_reduction, verify_intent_constraint_reduction};
 use baize_core::error::Error;
 use baize_core::labels::*;
-use baize_core::storage::Storage;
+use baize_core::approval::{ApprovalAction, PendingOperation};
 
 use super::Baize;
 use super::auditor::Auditor;
 use super::agent_manager::PermissionGuard;
-use crate::pipeline::is_timestamp_expired;
+use super::approval::ApprovalManager;
+
+// session 消息校验（非 handler 路径，在注册表分流前直接调用）
+use session_ops::validate_session_message_blob;
 
 /// 数据操作接口：blob 写入、label 追加、导入、导出
 pub trait DataOps {
-    /// 管道：blob 写入（含 type dispatch 校验）
+    /// 管道：Blob 写入（含 ASL 校验）
     fn pipe_blob_write(
         &self,
         agent_id: &str,
@@ -24,7 +30,7 @@ pub trait DataOps {
         labels: &HashMap<String, String>,
     ) -> Result<baize_core::storage::Blob, Error>;
 
-    /// 管道：label 追加
+    /// 管道：Label 追加
     fn pipe_label_add(
         &self,
         agent_id: &str,
@@ -33,7 +39,7 @@ pub trait DataOps {
         value: &str,
     ) -> Result<(), Error>;
 
-    /// 管道：数据导入
+    /// 管道：外部数据导入
     fn pipe_import(
         &self,
         agent_id: &str,
@@ -43,12 +49,65 @@ pub trait DataOps {
         extra_labels: Option<HashMap<String, String>>,
     ) -> Result<baize_core::storage::Blob, Error>;
 
-    /// 管道：数据导出
+    /// 管道：数据导出（含敏感度检查）
     fn pipe_export(
         &self,
         agent_id: &str,
         hash: &str,
     ) -> Result<baize_core::storage::Blob, Error>;
+}
+
+impl Baize {
+    /// Blob 写入实际执行（审批通过后由 pipe_blob_write 或 replay_operation 调用）
+    pub(crate) fn execute_blob_write(
+        &self,
+        agent_id: &str,
+        content: &str,
+        labels: &HashMap<String, String>,
+    ) -> Result<baize_core::storage::Blob, Error> {
+        let identity = self.verify_write_agent(agent_id)?;
+
+        let blob_type = labels.get("type").map(|s| s.as_str()).unwrap_or("");
+
+        // LNK session 消息分流：带 x-session-id 且非已知类型的一律走 session 消息校验
+        let handler = self.protocol_registry.get(blob_type);
+        let is_known = handler.is_some() || self.protocol_registry.is_known_type(blob_type);
+        let is_session_msg = labels.contains_key(LABEL_SESSION_ID) && !is_known;
+        if is_session_msg {
+            validate_session_message_blob(self.store(), labels, agent_id)?;
+        }
+
+        // 通过注册表查找 handler 执行校验 + proof 检查
+        if let Some(handler) = handler {
+            if handler.requires_proof() && identity.level >= 3 && agent_id != baize_core::ROOT_AGENT_ID {
+                self.require_valid_proof(agent_id)?;
+            }
+            let ctx = super::protocol::ValidationContext {
+                storage: self.store(),
+                identity: self.identity.as_ref(),
+                agent_id,
+            };
+            handler.validate(&ctx, content, labels)?;
+        }
+
+        // 写入 blob
+        let mut owned_labels = labels.clone();
+        owned_labels.insert("agent".to_string(), agent_id.to_string());
+        let blob = self.storage.blob_write(content, &owned_labels)?;
+
+        // Post-write 副作用（含回滚）— 重新查找 handler（借 checker 要求）
+        if let Some(handler) = self.protocol_registry.get(blob_type) {
+            if let Err(e) = handler.post_write(self.store(), &blob) {
+                if let Err(del_err) = self.storage.blob_delete(&blob.hash) {
+                    eprintln!("[WARN] post_write rollback: failed to delete blob {}: {}", blob.hash, del_err);
+                }
+                return Err(e);
+            }
+        }
+
+        self.audit("blob_write", agent_id, "success", Some(&blob.hash))?;
+        Ok(blob)
+    }
 }
 
 impl DataOps for Baize {
@@ -58,118 +117,13 @@ impl DataOps for Baize {
         content: &str,
         labels: &HashMap<String, String>,
     ) -> Result<baize_core::storage::Blob, Error> {
-        let identity = self.verify_write_agent(agent_id)?;
-
-        // v1: 按 type label 分派校验
-        let blob_type = labels.get("type").map(|s| s.as_str()).unwrap_or("");
-
-        // Phase 4: IDN-ATH proof 强制 — Level 3+ 敏感操作需有效 proof（root 豁免）
-        if identity.level >= 3 && agent_id != baize_core::ROOT_AGENT_ID && proof_required_for_blob_type(blob_type) {
-            self.require_valid_proof(agent_id)?;
-        }
-
-        // LNK session 消息优先检查：带 x-session-id 且非 init/accept/close 的一律走 session 消息校验
-        // 这必须在 type-based match 之前，因为 session 消息的 type 可以是任意值
-        let is_session_msg = labels.contains_key(LABEL_SESSION_ID)
-            && blob_type != BLOB_TYPE_SESSION_INIT
-            && blob_type != BLOB_TYPE_SESSION_ACCEPT
-            && blob_type != "session-close";
-
-        if is_session_msg {
-            validate_session_message_blob(&self.storage, labels)?;
-        } else {
-            match blob_type {
-                // ─── INT-GIR：通用意图 ───
-                BLOB_TYPE_INTENT => {
-                    validate_intent_blob(&self.storage, content, labels)?;
-                    // v2: 检查 intent 自身有效期
-                    if let Some(expires) = labels.get(LABEL_INTENT_EXPIRES) {
-                        if is_timestamp_expired(expires) {
-                            return Err(Error::IntentExpired(
-                                format!("intent expired at {}", expires)
-                            ));
-                        }
-                    }
-                }
-
-                // ─── INT-DER：子意图派生 ───
-                BLOB_TYPE_SUB_INTENT => {
-                    validate_sub_intent_blob(&self.storage, content, labels)?;
-                }
-
-                // ─── INT-RCT：执行回执 ───
-                BLOB_TYPE_RECEIPT => {
-                    validate_receipt_blob(&self.storage, content, labels)?;
-                }
-
-                // ─── AZN-APR/AZN-ISS：授权签发 ───
-                BLOB_TYPE_AUTHORIZATION => {
-                    validate_authorization_blob(&self.storage, content, labels)?;
-                }
-
-                // ─── LNK-SES：会话建立 ───
-                BLOB_TYPE_SESSION_INIT => {
-                    validate_session_init_blob(&self.storage, &self.agents, content, labels)?;
-                }
-
-                // ─── LNK-SES：会话接受 ───
-                BLOB_TYPE_SESSION_ACCEPT => {
-                    validate_session_accept_blob(&self.storage, content, labels, agent_id)?;
-                }
-
-                // ─── 其他类型：走原有逻辑 ───
-                _ => {}
-            }
-        }
-
-        let blob = self.storage.blob_write(content, labels)?;
-
-        // P1: receipt 写入后自动 CNV 全链路校验（失败回滚）
-        if blob.labels.get("type") == Some(&BLOB_TYPE_RECEIPT.to_string()) {
-            let cnv_result = baize_asl::verify::cnv_verify(&self.storage, &blob.hash);
-            match cnv_result {
-                Ok(result) if !result.valid => {
-                    let _ = self.storage.blob_delete(&blob.hash);
-                    return Err(Error::ConstraintViolation(
-                        format!("CNV verification failed: {}", result.errors.join("; "))
-                    ));
-                }
-                Err(e) => {
-                    let _ = self.storage.blob_delete(&blob.hash);
-                    return Err(e);
-                }
-                _ => {}
-            }
-        }
-
-        // P1: authorization 写入后自动 AZN-VER 校验（失败回滚）
-        if blob.labels.get("type") == Some(&BLOB_TYPE_AUTHORIZATION.to_string()) {
-            // 从 content 中读取 grant_type 作为 action_type（自动校验时无需外部指定）
-            let action_type = serde_json::from_str::<serde_json::Value>(&blob.content)
-                .ok()
-                .and_then(|v| v.get("grant_type").and_then(|g| g.as_str()).map(String::from))
-                .unwrap_or_else(|| "execute".to_string());
-            let authz_result = baize_asl::verify::verify_authorization(
-                &self.storage, &blob.hash, &action_type,
-                &baize_asl::verify::ExecutionContext::default(),
-            );
-            match authz_result {
-                Ok(result) if !result.valid => {
-                    let _ = self.storage.blob_delete(&blob.hash);
-                    return Err(Error::ConstraintViolation(
-                        format!("AZN-VER failed: {}", result.errors.join("; "))
-                    ));
-                }
-                Err(e) => {
-                    let _ = self.storage.blob_delete(&blob.hash);
-                    return Err(e);
-                }
-                _ => {}
-            }
-        }
-
-        self.audit("blob_write", agent_id, "success", Some(&blob.hash))?;
-        Ok(blob)
+        let op = PendingOperation::BlobWrite {
+            agent_id: agent_id.to_string(),
+            content: content.to_string(),
+            labels: labels.clone(),
+        };
+        self.check_approval_gate(agent_id, &ApprovalAction::BlobWrite, &op)?;
+        self.execute_blob_write(agent_id, content, labels)
     }
 
     fn pipe_label_add(
@@ -179,7 +133,26 @@ impl DataOps for Baize {
         key: &str,
         value: &str,
     ) -> Result<(), Error> {
-        self.verify_write_agent(agent_id)?;
+        let _identity = self.verify_write_agent(agent_id)?;
+
+        // 校验目标 blob 存在
+        let blob = self.storage.blob_read(entity_hash)
+            .map_err(|_| Error::NotFound(format!("blob {}", entity_hash)))?;
+
+        // blob 归属校验：agent 只能给自己的 blob 加 label（root 豁免）
+        if agent_id != baize_core::ROOT_AGENT_ID {
+            let blob_agent = blob.labels.get("agent");
+            let blob_owner = blob.labels.get("x-key-owner")
+                .or_else(|| blob.labels.get("x-cert-agent"));
+            let is_owner = blob_agent.map(|a| a == agent_id).unwrap_or(false)
+                || blob_owner.map(|a| a == agent_id).unwrap_or(false);
+            if !is_owner {
+                return Err(Error::PermissionDenied(
+                    format!("agent {} cannot modify labels on blob {} (not owner)", agent_id, entity_hash)
+                ));
+            }
+        }
+
         self.storage.label_add(entity_hash, key, value)?;
         self.audit("label_add", agent_id, "success", Some(entity_hash))?;
         Ok(())
@@ -193,7 +166,19 @@ impl DataOps for Baize {
         trust_level: u8,
         extra_labels: Option<HashMap<String, String>>,
     ) -> Result<baize_core::storage::Blob, Error> {
-        self.verify_write_agent(agent_id)?;
+        let identity = self.verify_write_agent(agent_id)?;
+
+        // trust_level 上限校验：不能超过 agent 自身 level
+        if trust_level > identity.level {
+            return Err(Error::Validation(
+                format!("trust_level {} exceeds agent {} level {}", trust_level, agent_id, identity.level)
+            ));
+        }
+
+        // source 非空校验
+        if source.trim().is_empty() {
+            return Err(Error::Validation("source cannot be empty for import".into()));
+        }
 
         let mut labels = extra_labels.unwrap_or_default();
         labels.insert("source".to_string(), source.to_string());
@@ -250,628 +235,6 @@ impl DataOps for Baize {
     }
 }
 
-// ─── v2 Phase 1.2: 有效期辅助函数 ───
-
-/// Phase 4: 判断 blob type 是否需要 Level 3+ proof
-fn proof_required_for_blob_type(blob_type: &str) -> bool {
-    matches!(blob_type,
-        BLOB_TYPE_AUTHORIZATION |
-        BLOB_TYPE_RECEIPT |
-        BLOB_TYPE_SESSION_INIT |
-        BLOB_TYPE_SESSION_ACCEPT
-    )
-}
-
-// ─── INT 校验函数 ───
-
-/// INT-GIR：通用意图写入校验
-fn validate_intent_blob(
-    storage: &Storage,
-    content: &str,
-    labels: &HashMap<String, String>,
-) -> Result<(), Error> {
-    let parsed: serde_json::Value = serde_json::from_str(content)
-        .map_err(|e| Error::Validation(format!("invalid intent JSON: {}", e)))?;
-
-    // 校验 intent_constraints 非空
-    let constraints = parsed.get("intent_constraints");
-    match constraints {
-        None | Some(serde_json::Value::Null) => {
-            return Err(Error::Validation("intent_constraints is required".into()));
-        }
-        Some(serde_json::Value::Object(m)) if m.is_empty() => {
-            return Err(Error::Validation("intent_constraints cannot be empty".into()));
-        }
-        _ => {}
-    }
-
-    // 校验 expires_at > created_at（解析为 DateTime 后比较，避免字符串比较不准）
-    let expires = parsed.get("expires_at").and_then(|v| v.as_str()).unwrap_or("");
-    let created = parsed.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-    if !expires.is_empty() && !created.is_empty() {
-        let exp_dt = chrono::DateTime::parse_from_rfc3339(expires);
-        let cre_dt = chrono::DateTime::parse_from_rfc3339(created);
-        if let (Ok(exp), Ok(cre)) = (exp_dt, cre_dt) {
-            if exp <= cre {
-                return Err(Error::Validation(
-                    "expires_at must be after created_at".into()
-                ));
-            }
-        }
-        // 解析失败时跳过比较（兼容非标准时间格式）
-    }
-
-    // 校验 x-intent-id 在有效期内唯一
-    if let Some(intent_id) = labels.get(LABEL_INTENT_ID) {
-        let mut filter = HashMap::new();
-        filter.insert(LABEL_INTENT_ID.to_string(), intent_id.clone());
-        filter.insert(LABEL_INTENT_STATUS.to_string(), "active".to_string());
-        let existing = storage.blob_query(&filter).unwrap_or_default();
-        if !existing.is_empty() {
-            return Err(Error::Conflict(
-                format!("intent_id '{}' already exists with active status", intent_id)
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// INT-DER：子意图派生写入校验
-fn validate_sub_intent_blob(
-    storage: &Storage,
-    content: &str,
-    _labels: &HashMap<String, String>,
-) -> Result<(), Error> {
-    let parsed: serde_json::Value = serde_json::from_str(content)
-        .map_err(|e| Error::Validation(format!("invalid sub-intent JSON: {}", e)))?;
-
-    // 读取 parent_intent_digest
-    let parent_digest = parsed.get("parent_intent_digest")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Validation("parent_intent_digest is required for sub-intent".into()))?;
-
-    // 校验父 blob 存在且 type 为 intent 或 sub-intent
-    let parent_blob = storage.blob_read(parent_digest)
-        .map_err(|_| Error::ChainBroken(format!("parent intent {} not found", parent_digest)))?;
-
-    let parent_type = parent_blob.labels.get("type").unwrap_or(&"".to_string()).clone();
-    if parent_type != BLOB_TYPE_INTENT && parent_type != BLOB_TYPE_SUB_INTENT {
-        return Err(Error::ChainBroken(format!(
-            "parent {} is not an intent (type='{}')", parent_digest, parent_type
-        )));
-    }
-
-    // v2: 检查父意图是否已过期
-    if let Some(parent_expires) = parent_blob.labels.get(LABEL_INTENT_EXPIRES) {
-        if is_timestamp_expired(parent_expires) {
-            return Err(Error::IntentExpired(
-                format!("parent intent expired at {}", parent_expires)
-            ));
-        }
-    }
-
-    // 校验约束收缩
-    let child_constraints = parsed.get("intent_constraints").cloned().unwrap_or_default();
-    let parent_content: serde_json::Value = serde_json::from_str(&parent_blob.content)
-        .unwrap_or_default();
-    let parent_constraints = parent_content.get("intent_constraints").cloned().unwrap_or_default();
-
-    verify_intent_constraint_reduction(&parent_constraints, &child_constraints)
-        .map_err(|e| Error::ConstraintViolation(e.to_string()))?;
-
-    // 校验 derivation_depth = 父 depth + 1
-    let parent_depth: u32 = parent_blob.labels.get(LABEL_DERIVATION_DEPTH)
-        .and_then(|d| d.parse().ok())
-        .unwrap_or(0);
-    let child_depth: u32 = parsed.get("derivation_depth")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-
-    if child_depth != parent_depth + 1 {
-        return Err(Error::Validation(format!(
-            "derivation_depth must be {} (parent depth + 1), got {}",
-            parent_depth + 1, child_depth
-        )));
-    }
-
-    // 校验 expires_at 不晚于父 expires_at
-    let child_expires = parsed.get("expires_at").and_then(|v| v.as_str()).unwrap_or("");
-    let parent_expires = parent_blob.labels.get(LABEL_INTENT_EXPIRES)
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    if !child_expires.is_empty() && !parent_expires.is_empty() && child_expires > parent_expires {
-        return Err(Error::Validation(
-            "sub-intent expires_at cannot be later than parent expires_at".into()
-        ));
-    }
-
-    Ok(())
-}
-
-/// INT-RCT：执行回执写入校验
-fn validate_receipt_blob(
-    storage: &Storage,
-    content: &str,
-    _labels: &HashMap<String, String>,
-) -> Result<(), Error> {
-    let parsed: serde_json::Value = serde_json::from_str(content)
-        .map_err(|e| Error::Validation(format!("invalid receipt JSON: {}", e)))?;
-
-    // 校验 intent_digest 对应 blob 存在且为 intent/sub-intent
-    let intent_digest = parsed.get("intent_digest")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Validation("intent_digest is required for receipt".into()))?;
-
-    let intent_blob = storage.blob_read(intent_digest)
-        .map_err(|_| Error::ChainBroken(format!("intent {} not found for receipt", intent_digest)))?;
-
-    let intent_type = intent_blob.labels.get("type").unwrap_or(&"".to_string()).clone();
-    if intent_type != BLOB_TYPE_INTENT && intent_type != BLOB_TYPE_SUB_INTENT {
-        return Err(Error::ChainBroken(format!(
-            "intent_digest points to non-intent type '{}'", intent_type
-        )));
-    }
-
-    // 校验 authorization_digest 对应 blob 存在且为 authorization
-    let authz_digest = parsed.get("authorization_digest")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Validation("authorization_digest is required for receipt".into()))?;
-
-    let authz_blob = storage.blob_read(authz_digest)
-        .map_err(|_| Error::ChainBroken(format!("authorization {} not found for receipt", authz_digest)))?;
-
-    let authz_type = authz_blob.labels.get("type").unwrap_or(&"".to_string()).clone();
-    if authz_type != BLOB_TYPE_AUTHORIZATION {
-        return Err(Error::ChainBroken(format!(
-            "authorization_digest points to non-authorization type '{}'", authz_type
-        )));
-    }
-
-    // v2: 检查授权是否已过期
-    let authz_parsed: serde_json::Value = serde_json::from_str(&authz_blob.content)
-        .map_err(|e| Error::ChainBroken(format!("invalid authorization content: {}", e)))?;
-    if let Some(authz_exp) = authz_parsed.get("exp").and_then(|v| v.as_str()) {
-        if is_timestamp_expired(authz_exp) {
-            return Err(Error::AuthorizationExpired(
-                format!("authorization expired at {}", authz_exp)
-            ));
-        }
-    }
-
-    // 校验 result_status 与 execution_result/rejection_reason 一致性
-    let result_status = parsed.get("result_status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if result_status == "REJECTED" && parsed.get("rejection_reason").is_none() {
-        return Err(Error::Validation(
-            "rejection_reason is required when result_status is REJECTED".into()
-        ));
-    }
-
-    Ok(())
-}
-
-// ─── AZN 校验函数 ───
-
-/// AZN-APR/AZN-ISS：授权签发写入校验
-fn validate_authorization_blob(
-    storage: &Storage,
-    content: &str,
-    _labels: &HashMap<String, String>,
-) -> Result<(), Error> {
-    let parsed: serde_json::Value = serde_json::from_str(content)
-        .map_err(|e| Error::Validation(format!("invalid authorization JSON: {}", e)))?;
-
-    // 校验 source_intent_digest 对应 blob 存在且有效
-    let source_intent = parsed.get("source_intent_digest")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Validation("source_intent_digest is required".into()))?;
-
-    // 校验 constraints 非空（协议 §10.2：必备且非空）
-    let constraints = parsed.get("constraints")
-        .ok_or_else(|| Error::Validation("constraints is required".into()))?;
-    if constraints.is_null() || (constraints.is_object() && constraints.as_object().map_or(true, |m| m.is_empty())) {
-        return Err(Error::Validation("constraints must not be empty".into()));
-    }
-
-    let intent_blob = storage.blob_read(source_intent)
-        .map_err(|_| Error::ChainBroken(format!("source intent {} not found", source_intent)))?;
-
-    let intent_type = intent_blob.labels.get("type").unwrap_or(&"".to_string()).clone();
-    if intent_type != BLOB_TYPE_INTENT && intent_type != BLOB_TYPE_SUB_INTENT {
-        return Err(Error::ChainBroken(format!(
-            "source_intent_digest points to non-intent type '{}'", intent_type
-        )));
-    }
-
-    // 校验意图状态：expired 或 revoked 均无效
-    let intent_status = intent_blob.labels.get(LABEL_INTENT_STATUS)
-        .map(|s| s.as_str())
-        .unwrap_or("active");
-    if intent_status == "expired" || intent_status == "revoked" {
-        return Err(Error::Validation(
-            format!("source intent is {}", intent_status)
-        ));
-    }
-
-    // v2: 检查源意图是否已过期（时间维度）
-    if let Some(intent_expires) = intent_blob.labels.get(LABEL_INTENT_EXPIRES) {
-        if is_timestamp_expired(intent_expires) {
-            return Err(Error::IntentExpired(
-                format!("source intent expired at {}", intent_expires)
-            ));
-        }
-    }
-
-    // 校验签发方凭证状态（查 x-cert-revoked/suspended/expired label）
-    let issuer = parsed.get("issuer")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !issuer.is_empty() {
-        let mut filter = HashMap::new();
-        filter.insert("type".to_string(), BLOB_TYPE_AGENT_CERT.to_string());
-        filter.insert(LABEL_CERT_AGENT.to_string(), issuer.to_string());
-        let certs = storage.blob_query(&filter).unwrap_or_default();
-        if let Some(cert) = certs.first() {
-            if cert.labels.contains_key(LABEL_CERT_REVOKED) {
-                return Err(Error::PermissionDenied(
-                    format!("issuer {} is revoked", issuer)
-                ));
-            }
-            if cert.labels.contains_key(LABEL_CERT_SUSPENDED) {
-                return Err(Error::PermissionDenied(
-                    format!("issuer {} is suspended", issuer)
-                ));
-            }
-            if cert.labels.contains_key(LABEL_CERT_EXPIRED) {
-                return Err(Error::PermissionDenied(
-                    format!("issuer {} is expired", issuer)
-                ));
-            }
-        }
-    }
-
-    // 校验 exp 不晚于意图 expires_at
-    let authz_exp = parsed.get("exp").and_then(|v| v.as_str()).unwrap_or("");
-    let intent_expires = intent_blob.labels.get(LABEL_INTENT_EXPIRES)
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    if !authz_exp.is_empty() && !intent_expires.is_empty() && authz_exp > intent_expires {
-        return Err(Error::Validation(
-            "authorization exp cannot be later than intent expires_at".into()
-        ));
-    }
-
-    // AZN-DLG：如果有 parent_authz_digest，校验委托链
-    if let Some(parent_digest) = parsed.get("parent_authz_digest").and_then(|v| v.as_str()) {
-        validate_delegation(storage, &parsed, parent_digest)?;
-    }
-
-    Ok(())
-}
-
-/// AZN-DLG：委托子授权校验
-fn validate_delegation(
-    storage: &Storage,
-    authz_content: &serde_json::Value,
-    parent_digest: &str,
-) -> Result<(), Error> {
-    // 读取父授权 blob
-    let parent_blob = storage.blob_read(parent_digest)
-        .map_err(|_| Error::ChainBroken(format!("parent authorization {} not found", parent_digest)))?;
-
-    if parent_blob.labels.get("type").unwrap_or(&"".to_string()) != BLOB_TYPE_AUTHORIZATION {
-        return Err(Error::ChainBroken(format!(
-            "parent {} is not authorization type", parent_digest
-        )));
-    }
-
-    let parent_authz: serde_json::Value = serde_json::from_str(&parent_blob.content)
-        .map_err(|e| Error::ChainBroken(format!("invalid parent authorization: {}", e)))?;
-
-    // 校验父授权状态
-    let parent_status = parent_blob.labels.get(LABEL_AUTHZ_STATUS)
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    if parent_status != "valid" {
-        return Err(Error::Validation(
-            format!("parent authorization status is '{}', expected 'valid'", parent_status)
-        ));
-    }
-
-    // 校验约束收缩
-    let parent_constraints = parent_authz.get("constraints").cloned().unwrap_or_default();
-    let child_constraints = authz_content.get("constraints").cloned().unwrap_or_default();
-
-    verify_authz_constraint_reduction(&parent_constraints, &child_constraints)
-        .map_err(|e| Error::ConstraintViolation(e.to_string()))?;
-
-    // 校验 delegation_depth_remaining = 父 - 1
-    let parent_depth = parent_authz.get("delegation_depth_remaining")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let child_depth = authz_content.get("delegation_depth_remaining")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    if child_depth != parent_depth.saturating_sub(1) {
-        return Err(Error::Validation(format!(
-            "delegation_depth_remaining must be {}, got {}",
-            parent_depth.saturating_sub(1), child_depth
-        )));
-    }
-
-    // 校验 root_authorizer 一致
-    let parent_root = parent_authz.get("root_authorizer")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let child_root = authz_content.get("root_authorizer")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if parent_root != child_root {
-        return Err(Error::Validation(
-            format!("root_authorizer mismatch: parent={}, child={}", parent_root, child_root)
-        ));
-    }
-
-    // 校验父 delegatable = true
-    let parent_delegatable = parent_authz.get("delegatable")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !parent_delegatable {
-        return Err(Error::Validation(
-            format!("parent authorization {} is not delegatable", parent_digest)
-        ));
-    }
-
-    Ok(())
-}
-
-// ─── LNK 校验函数 ───
-
-/// LNK 加密套件白名单（当前仅支持 AES-256-GCM）
-const KNOWN_CIPHER_SUITES: &[&str] = &["AES-256-GCM"];
-
-/// LNK-SES：session-init 写入校验
-fn validate_session_init_blob(
-    storage: &Storage,
-    agents: &std::collections::HashMap<String, (baize_core::cert::CertIdentity, baize_core::cert::IssuerCtx)>,
-    content: &str,
-    labels: &HashMap<String, String>,
-) -> Result<(), Error> {
-    // 校验 peer_b 是已注册 agent
-    let peer_b = labels.get(LABEL_SESSION_PEER_B)
-        .ok_or_else(|| Error::Validation("x-session-peer-b is required for session-init".into()))?;
-
-    if !agents.contains_key(peer_b) {
-        return Err(Error::Validation(
-            format!("peer_b '{}' is not a registered agent", peer_b)
-        ));
-    }
-
-    // 校验 x-session-id 全局唯一（查询是否已有同 session-id 的 init blob）
-    let session_id = labels.get(LABEL_SESSION_ID)
-        .ok_or_else(|| Error::Validation("x-session-id is required for session-init".into()))?;
-
-    let mut filter = HashMap::new();
-    filter.insert("type".to_string(), BLOB_TYPE_SESSION_INIT.to_string());
-    filter.insert(LABEL_SESSION_ID.to_string(), session_id.clone());
-    let existing = storage.blob_query(&filter).unwrap_or_default();
-    if !existing.is_empty() {
-        return Err(Error::Conflict(
-            format!("session '{}' already initialized", session_id)
-        ));
-    }
-
-    // Phase 3: 校验 content JSON 包含 ephemeral_pub（非空字符串）
-    let parsed: serde_json::Value = serde_json::from_str(content)
-        .map_err(|e| Error::Validation(format!("invalid session-init JSON: {}", e)))?;
-    let ephemeral_pub = parsed.get("ephemeral_pub")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if ephemeral_pub.is_empty() {
-        return Err(Error::Validation("ephemeral_pub is required for session-init".into()));
-    }
-
-    // 校验 ephemeral_pub 是合法的 X25519 公钥
-    baize_core::crypto::decode_x25519_public(ephemeral_pub)
-        .map_err(|e| Error::Validation(format!("invalid ephemeral_pub: {}", e)))?;
-
-    // Phase 3: 校验 cipher_suites（必须包含 AES-256-GCM，且所有套件在白名单内）
-    let empty_suites = vec![];
-    let cipher_suites = parsed.get("cipher_suites")
-        .and_then(|v| v.as_array())
-        .unwrap_or(&empty_suites);
-    for suite in cipher_suites {
-        if let Some(s) = suite.as_str() {
-            if !KNOWN_CIPHER_SUITES.contains(&s) {
-                return Err(Error::Validation(
-                    format!("unknown cipher suite '{}', known: {:?}", s, KNOWN_CIPHER_SUITES)
-                ));
-            }
-        }
-    }
-    let has_aes_gcm = cipher_suites.iter().any(|s| {
-        s.as_str() == Some("AES-256-GCM")
-    });
-    if !has_aes_gcm {
-        return Err(Error::Validation(
-            "cipher_suites must include 'AES-256-GCM'".into()
-        ));
-    }
-
-    Ok(())
-}
-
-/// LNK-SES：session-accept 写入校验
-fn validate_session_accept_blob(
-    storage: &Storage,
-    content: &str,
-    labels: &HashMap<String, String>,
-    writer_agent: &str,
-) -> Result<(), Error> {
-    let session_id = labels.get(LABEL_SESSION_ID)
-        .ok_or_else(|| Error::Validation("x-session-id is required for session-accept".into()))?;
-
-    // 校验对应的 session-init blob 存在
-    let mut filter = HashMap::new();
-    filter.insert("type".to_string(), BLOB_TYPE_SESSION_INIT.to_string());
-    filter.insert(LABEL_SESSION_ID.to_string(), session_id.clone());
-    let init_blobs = storage.blob_query(&filter).unwrap_or_default();
-
-    if init_blobs.is_empty() {
-        return Err(Error::ChainBroken(
-            format!("session '{}' has no init blob", session_id)
-        ));
-    }
-
-    // 校验 accept 方是 session-init 中 x-session-peer-b
-    let peer_b = init_blobs[0].labels.get(LABEL_SESSION_PEER_B)
-        .map(|s| s.clone())
-        .unwrap_or_default();
-    if peer_b != writer_agent {
-        return Err(Error::PermissionDenied(
-            format!("only peer_b '{}' can accept this session, got '{}'", peer_b, writer_agent)
-        ));
-    }
-
-    // 校验没有已存在的 accept（一个 session 只能 accept 一次）
-    let mut accept_filter = HashMap::new();
-    accept_filter.insert("type".to_string(), BLOB_TYPE_SESSION_ACCEPT.to_string());
-    accept_filter.insert(LABEL_SESSION_ID.to_string(), session_id.clone());
-    let existing_accepts = storage.blob_query(&accept_filter).unwrap_or_default();
-    if !existing_accepts.is_empty() {
-        return Err(Error::Conflict(
-            format!("session '{}' already accepted", session_id)
-        ));
-    }
-
-    // 校验 parent 指向 session-init blob
-    if let Some(parent) = labels.get("parent") {
-        if *parent != init_blobs[0].hash {
-            return Err(Error::ChainBroken(
-                "session-accept parent must point to session-init blob".into()
-            ));
-        }
-    }
-
-    // Phase 3: 校验 content JSON 包含 ephemeral_pub（非空字符串）
-    let parsed: serde_json::Value = serde_json::from_str(content)
-        .map_err(|e| Error::Validation(format!("invalid session-accept JSON: {}", e)))?;
-    let ephemeral_pub = parsed.get("ephemeral_pub")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if ephemeral_pub.is_empty() {
-        return Err(Error::Validation("ephemeral_pub is required for session-accept".into()));
-    }
-
-    // 校验 ephemeral_pub 是合法的 X25519 公钥
-    baize_core::crypto::decode_x25519_public(ephemeral_pub)
-        .map_err(|e| Error::Validation(format!("invalid ephemeral_pub: {}", e)))?;
-
-    // Phase 3: 校验 selected_cipher_suite 在 init 的 cipher_suites 中
-    let selected = parsed.get("selected_cipher_suite")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if selected.is_empty() {
-        return Err(Error::Validation("selected_cipher_suite is required for session-accept".into()));
-    }
-
-    // 读取 init blob 的 content 获取 cipher_suites
-    let init_content: serde_json::Value = serde_json::from_str(&init_blobs[0].content).unwrap_or_default();
-    let init_suites = init_content.get("cipher_suites")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let suite_match = init_suites.iter().any(|s| s.as_str() == Some(selected));
-    if !suite_match {
-        return Err(Error::Validation(
-            format!("selected_cipher_suite '{}' not in init cipher_suites", selected)
-        ));
-    }
-
-    Ok(())
-}
-
-/// LNK-DTX：session 内消息写入校验
-fn validate_session_message_blob(
-    storage: &Storage,
-    labels: &HashMap<String, String>,
-) -> Result<(), Error> {
-    let session_id = labels.get(LABEL_SESSION_ID)
-        .ok_or_else(|| Error::Validation("x-session-id is required for session messages".into()))?;
-
-    // 查询该 session 是否已关闭
-    let mut close_filter = HashMap::new();
-    close_filter.insert(LABEL_SESSION_STATUS.to_string(), "closed".to_string());
-    close_filter.insert(LABEL_SESSION_ID.to_string(), session_id.clone());
-    let closed_blobs = storage.blob_query(&close_filter).unwrap_or_default();
-    if !closed_blobs.is_empty() {
-        return Err(Error::Validation(
-            format!("session '{}' is closed", session_id)
-        ));
-    }
-
-    // 校验 session-init + session-accept 已完成
-    let mut init_filter = HashMap::new();
-    init_filter.insert("type".to_string(), BLOB_TYPE_SESSION_INIT.to_string());
-    init_filter.insert(LABEL_SESSION_ID.to_string(), session_id.clone());
-    let init_blobs = storage.blob_query(&init_filter).unwrap_or_default();
-    if init_blobs.is_empty() {
-        return Err(Error::ChainBroken(
-            format!("session '{}' has no init blob", session_id)
-        ));
-    }
-
-    // 校验 session 未过期（从 init blob content 中读取 expires_at）
-    if let Ok(init_content) = serde_json::from_str::<serde_json::Value>(&init_blobs[0].content) {
-        if let Some(expires) = init_content.get("expires_at").and_then(|v| v.as_str()) {
-            if is_timestamp_expired(expires) {
-                return Err(Error::Validation(
-                    format!("session '{}' expired at {}", session_id, expires)
-                ));
-            }
-        }
-    }
-
-    let mut accept_filter = HashMap::new();
-    accept_filter.insert("type".to_string(), BLOB_TYPE_SESSION_ACCEPT.to_string());
-    accept_filter.insert(LABEL_SESSION_ID.to_string(), session_id.clone());
-    let accept_blobs = storage.blob_query(&accept_filter).unwrap_or_default();
-    if accept_blobs.is_empty() {
-        return Err(Error::ChainBroken(
-            format!("session '{}' has no accept blob — handshake not completed", session_id)
-        ));
-    }
-
-    // 校验 x-message-seq 单调递增
-    if let Some(seq_str) = labels.get(LABEL_MESSAGE_SEQ) {
-        let current_seq: u64 = seq_str.parse()
-            .map_err(|_| Error::Validation(format!("invalid x-message-seq: {}", seq_str)))?;
-
-        // 查询当前 session 内最大 seq
-        let mut msg_filter = HashMap::new();
-        msg_filter.insert(LABEL_SESSION_ID.to_string(), session_id.clone());
-        let existing_msgs = storage.blob_query(&msg_filter).unwrap_or_default();
-
-        let max_seq: u64 = existing_msgs.iter()
-            .filter_map(|b| b.labels.get(LABEL_MESSAGE_SEQ))
-            .filter_map(|s| s.parse::<u64>().ok())
-            .max()
-            .unwrap_or(0);
-
-        if current_seq != max_seq + 1 {
-            return Err(Error::Validation(format!(
-                "x-message-seq must be {}, got {}", max_seq + 1, current_seq
-            )));
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,7 +247,7 @@ mod tests {
     }
 
     fn register_agent(baize: &mut Baize, name: &str, level: u8) {
-        baize.agent_register(name, Level(level), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", name, Level(level), vec!["A"], None).unwrap();
     }
 
     // ─── INT tests ───
@@ -1191,7 +554,7 @@ mod tests {
 
         // message seq=1
         let mut msg_labels = HashMap::new();
-        msg_labels.insert("type".to_string(), BLOB_TYPE_INTENT.to_string());
+        msg_labels.insert("type".to_string(), "session-message".to_string());
         msg_labels.insert(LABEL_SESSION_ID.to_string(), "sess-004".to_string());
         msg_labels.insert(LABEL_MESSAGE_SEQ.to_string(), "1".to_string());
 
@@ -1223,7 +586,7 @@ mod tests {
 
         // seq=3 (should be 1)
         let mut msg_labels = HashMap::new();
-        msg_labels.insert("type".to_string(), BLOB_TYPE_INTENT.to_string());
+        msg_labels.insert("type".to_string(), "session-message".to_string());
         msg_labels.insert(LABEL_SESSION_ID.to_string(), "sess-005".to_string());
         msg_labels.insert(LABEL_MESSAGE_SEQ.to_string(), "3".to_string());
 
@@ -1750,7 +1113,7 @@ mod tests {
 
         // 尝试在关闭后发 message → 应被拒绝
         let mut msg_labels = HashMap::new();
-        msg_labels.insert("type".to_string(), BLOB_TYPE_INTENT.to_string());
+        msg_labels.insert("type".to_string(), "session-message".to_string());
         msg_labels.insert(LABEL_SESSION_ID.to_string(), "sess-close-msg".to_string());
         msg_labels.insert(LABEL_MESSAGE_SEQ.to_string(), "1".to_string());
 
@@ -1794,7 +1157,7 @@ mod tests {
 
         // 尝试在过期 session 发 message → 应被拒绝
         let mut msg_labels = HashMap::new();
-        msg_labels.insert("type".to_string(), BLOB_TYPE_INTENT.to_string());
+        msg_labels.insert("type".to_string(), "session-message".to_string());
         msg_labels.insert(LABEL_SESSION_ID.to_string(), "sess-expired".to_string());
         msg_labels.insert(LABEL_MESSAGE_SEQ.to_string(), "1".to_string());
 
@@ -1804,5 +1167,75 @@ mod tests {
             Err(Error::Validation(msg)) => assert!(msg.contains("expired"), "got: {}", msg),
             other => panic!("expected Validation, got {:?}", other),
         }
+    }
+
+    // ─── Phase 2: 自定义 handler 集成测试 ───
+
+    #[test]
+    fn custom_handler_validates_and_writes_via_pipe_blob_write() {
+        use crate::pipeline::protocol::{BlobTypeHandler, ValidationContext};
+
+        struct NoteHandler;
+        impl BlobTypeHandler for NoteHandler {
+            fn blob_type(&self) -> &str { "note" }
+            fn validate(
+                &self,
+                _ctx: &ValidationContext,
+                content: &str,
+                _labels: &HashMap<String, String>,
+            ) -> Result<(), Error> {
+                let _: serde_json::Value = serde_json::from_str(content)
+                    .map_err(|e| Error::Validation(format!("note must be valid JSON: {}", e)))?;
+                Ok(())
+            }
+        }
+
+        let mut baize = setup_baize();
+        baize.register_handler(Box::new(NoteHandler));
+        register_agent(&mut baize, "alice", 2);
+
+        // 有效 JSON 应通过自定义 handler 校验并写入
+        let mut labels = HashMap::new();
+        labels.insert("type".to_string(), "note".to_string());
+        let blob = baize.pipe_blob_write("alice", r#"{"text":"hello"}"#, &labels).unwrap();
+        assert_eq!(blob.labels.get("type").unwrap(), "note");
+        assert_eq!(blob.labels.get("agent").unwrap(), "alice");
+
+        // 无效 JSON 应被自定义 handler 拒绝
+        let result = baize.pipe_blob_write("alice", "not json", &labels);
+        assert!(result.is_err());
+        match result {
+            Err(Error::Validation(msg)) => assert!(msg.contains("note must be valid JSON"), "got: {}", msg),
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn override_default_handler_with_custom() {
+        use crate::pipeline::protocol::{BlobTypeHandler, ValidationContext};
+
+        // 自定义 intent handler：总是通过（跳过所有校验）
+        struct FastIntentHandler;
+        impl BlobTypeHandler for FastIntentHandler {
+            fn blob_type(&self) -> &str { "intent" }
+            fn validate(
+                &self,
+                _ctx: &ValidationContext,
+                _content: &str,
+                _labels: &HashMap<String, String>,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let mut baize = setup_baize();
+        baize.register_handler(Box::new(FastIntentHandler));
+        register_agent(&mut baize, "alice", 2);
+
+        // 空 content 应被默认 IntentHandler 拒绝，但自定义 handler 放行
+        let mut labels = HashMap::new();
+        labels.insert("type".to_string(), "intent".to_string());
+        let result = baize.pipe_blob_write("alice", "", &labels);
+        assert!(result.is_ok(), "custom handler should override default validation");
     }
 }

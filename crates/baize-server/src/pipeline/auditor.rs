@@ -4,6 +4,7 @@ use baize_core::error::Error;
 use baize_core::labels::*;
 
 use super::Baize;
+use super::agent_manager::PermissionGuard;
 
 // ─── 审计链常量 ───
 
@@ -65,8 +66,18 @@ impl Auditor for Baize {
         }
 
         // v2 Phase 1.4: 审计增强 — 记录 agent 凭证状态
-        if let Some((identity, _)) = self.agents.get(agent_id) {
+        if let Some(identity) = self.identity.get_identity(agent_id) {
             labels.insert(LABEL_CERT_STATUS.to_string(), format!("{}", identity.status));
+
+            // Phase 2.2: Level 3+ 操作记录 proof binding context digest
+            if identity.level >= 3 && agent_id != baize_core::ROOT_AGENT_ID {
+                if let Ok(proof) = self.require_valid_proof(agent_id) {
+                    labels.insert(
+                        LABEL_BINDING_CONTEXT_DIGEST.to_string(),
+                        proof.binding_context_digest,
+                    );
+                }
+            }
         }
 
         // 5. 构造 content

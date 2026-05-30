@@ -48,10 +48,10 @@ fn test_wave_code_deployment_review() {
     // ──────────────────────────────────────────────
 
     // 注册 4 个 agent（root 已存在）
-    baize.agent_register("reviewer", Level(2), vec!["review", "staging"], None).unwrap();
-    baize.agent_register("auditor", Level(2), vec!["security"], None).unwrap();
-    baize.agent_register("deployer", Level(2), vec!["deploy", "staging"], None).unwrap();
-    baize.agent_register("observer", Level(0), vec![], None).unwrap();
+    baize.agent_register("baize-root", "reviewer", Level(2), vec!["review", "staging"], None).unwrap();
+    baize.agent_register("baize-root", "auditor", Level(2), vec!["security"], None).unwrap();
+    baize.agent_register("baize-root", "deployer", Level(2), vec!["deploy", "staging"], None).unwrap();
+    baize.agent_register("baize-root", "observer", Level(0), vec![], None).unwrap();
 
     // 验证 agent 列表：root + 4 = 5
     let agents = baize.agent_list();
@@ -480,8 +480,8 @@ fn test_wave_delegation_chain() {
     let mut baize = Baize::init_in_memory().unwrap();
 
     // root → tech-lead → reviewer（三层委托）
-    baize.agent_register("tech-lead", Level(2), vec!["review", "staging", "security"], None).unwrap();
-    baize.agent_register("junior-reviewer", Level(2), vec!["review"], Some("tech-lead")).unwrap();
+    baize.agent_register("baize-root", "tech-lead", Level(2), vec!["review", "staging", "security"], None).unwrap();
+    baize.agent_register("baize-root", "junior-reviewer", Level(2), vec!["review"], Some("tech-lead")).unwrap();
 
     // 三级身份链
     let chain = baize.trace_identity("junior-reviewer").unwrap();
@@ -512,8 +512,8 @@ fn test_wave_delegation_chain() {
 fn test_wave_elevation_cross_zone() {
     let mut baize = Baize::init_in_memory().unwrap();
 
-    baize.agent_register("reviewer", Level(2), vec!["review"], None).unwrap();
-    baize.agent_register("auditor", Level(2), vec!["security"], None).unwrap();
+    baize.agent_register("baize-root", "reviewer", Level(2), vec!["review"], None).unwrap();
+    baize.agent_register("baize-root", "auditor", Level(2), vec!["security"], None).unwrap();
 
     // reviewer 需要 security zone 读权限来做交叉检查
     let elev_id = baize.elevation_request(
@@ -543,8 +543,8 @@ fn test_wave_elevation_cross_zone() {
 fn test_wave_push_pull_cross_agent_sync() {
     let mut baize = Baize::init_in_memory().unwrap();
 
-    baize.agent_register("dev-a", Level(2), vec!["review"], None).unwrap();
-    baize.agent_register("dev-b", Level(2), vec!["review"], None).unwrap();
+    baize.agent_register("baize-root", "dev-a", Level(2), vec!["review"], None).unwrap();
+    baize.agent_register("baize-root", "dev-b", Level(2), vec!["review"], None).unwrap();
 
     // dev-a 写入并 push
     baize.pipe_file_write("dev-a", "review/module-a.rs", b"pub fn hello() {}", None).unwrap();
@@ -579,7 +579,7 @@ fn test_wave_push_pull_cross_agent_sync() {
 fn test_wave_credential_lifecycle() {
     let mut baize = Baize::init_in_memory().unwrap();
 
-    baize.agent_register("contractor", Level(2), vec!["review"], None).unwrap();
+    baize.agent_register("baize-root", "contractor", Level(2), vec!["review"], None).unwrap();
 
     // 正常工作
     let blob = baize.pipe_blob_write(
@@ -624,7 +624,7 @@ fn test_wave_credential_lifecycle() {
 #[test]
 fn test_v2_expired_intent_rejected() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("planner", Level(2), vec!["deploy"], None).unwrap();
+    baize.agent_register("baize-root", "planner", Level(2), vec!["deploy"], None).unwrap();
 
     // 创建一个已过期的根意图（绕过管道直接写入 storage）
     let mut parent_labels = HashMap::new();
@@ -684,7 +684,7 @@ fn test_v2_expired_intent_rejected() {
 #[test]
 fn test_v2_expired_authz_rejected() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("executor", Level(2), vec!["deploy"], None).unwrap();
+    baize.agent_register("baize-root", "executor", Level(2), vec!["deploy"], None).unwrap();
 
     // 创建有效的 intent
     let intent_labels = labels! {
@@ -724,7 +724,7 @@ fn test_v2_expired_authz_rejected() {
 #[test]
 fn test_v2_elevation_enforced() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("worker", Level(2), vec!["zone-a"], None).unwrap();
+    baize.agent_register("baize-root", "worker", Level(2), vec!["zone-a"], None).unwrap();
 
     // worker 自身只有 zone-a，写入 zone-b 应被拒绝
     let result = baize.pipe_file_write("worker", "zone-b/secret.txt", b"hack", None);
@@ -760,7 +760,7 @@ fn test_v2_elevation_enforced() {
 #[test]
 fn test_v2_expired_elevation_blocks() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("worker", Level(2), vec!["zone-a"], None).unwrap();
+    baize.agent_register("baize-root", "worker", Level(2), vec!["zone-a"], None).unwrap();
 
     // 直接写入一个已过期的 elevation blob（绕过管道构造过期状态）
     let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
@@ -785,7 +785,7 @@ fn test_v2_expired_elevation_blocks() {
 #[test]
 fn test_v2_audit_credential_status() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("worker", Level(2), vec!["zone-a"], None).unwrap();
+    baize.agent_register("baize-root", "worker", Level(2), vec!["zone-a"], None).unwrap();
 
     // worker 写入 blob → 触发审计
     baize.pipe_blob_write("worker", "test data", &labels! {}).unwrap();
@@ -822,7 +822,7 @@ fn test_v2_audit_credential_status() {
 #[test]
 fn test_v2_revoked_agent_fully_blocked() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("rogue", Level(2), vec!["zone-a"], None).unwrap();
+    baize.agent_register("baize-root", "rogue", Level(2), vec!["zone-a"], None).unwrap();
 
     // 先写入一个 blob
     let blob = baize.pipe_blob_write("rogue", "initial data", &labels! {}).unwrap();
@@ -848,7 +848,7 @@ fn test_v2_revoked_agent_fully_blocked() {
 #[test]
 fn test_v2_suspended_agent_blocked() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("worker", Level(2), vec!["zone-a"], None).unwrap();
+    baize.agent_register("baize-root", "worker", Level(2), vec!["zone-a"], None).unwrap();
 
     // 暂停 worker
     baize.update_credential_status("worker", CredentialStatus::Suspended, "maintenance").unwrap();
@@ -879,8 +879,8 @@ fn test_v2_suspended_agent_blocked() {
 fn test_v2_encrypted_session() {
     let mut baize = Baize::init_in_memory().unwrap();
     // 注：session 测试用 Level 2 而非 Level 3，避免 IDN-ATH proof 要求干扰 E2E 加密流测试
-    baize.agent_register("alice", Level(2), vec!["zone-a"], None).unwrap();
-    baize.agent_register("bob", Level(2), vec!["zone-a"], None).unwrap();
+    baize.agent_register("baize-root", "alice", Level(2), vec!["zone-a"], None).unwrap();
+    baize.agent_register("baize-root", "bob", Level(2), vec!["zone-a"], None).unwrap();
 
     // 1. 双方生成 X25519 密钥对
     let (priv_a, pub_pem_a) = baize_core::crypto::generate_x25519_keypair().unwrap();
@@ -960,7 +960,7 @@ fn test_v2_proof_required_for_sensitive_ops() {
     use baize_server::pipeline::agent_manager::PermissionGuard;
 
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("sensitive-agent", Level(3), vec!["A"], None).unwrap();
+    baize.agent_register("baize-root", "sensitive-agent", Level(3), vec!["A"], None).unwrap();
 
     // Level 3 agent 无 proof → 写 authorization 应被拒
     let result = baize.pipe_blob_write("sensitive-agent", "plain data", &labels! {
@@ -1031,7 +1031,7 @@ fn test_v2_key_rotation() {
     use baize_server::pipeline::agent_manager::KmsManager;
 
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("rot-worker", Level(2), vec!["A"], None).unwrap();
+    baize.agent_register("baize-root", "rot-worker", Level(2), vec!["A"], None).unwrap();
 
     // 获取旧密钥 hash
     let old_key = baize.kms_get_active_key("rot-worker", "IDN_SIGN").unwrap();
@@ -1060,21 +1060,176 @@ fn test_v2_key_rotation() {
     assert!(write_result.is_ok(), "agent should still work after key rotation: {:?}", write_result);
 
     // 轮换后签名 middleware 应能用新密钥验证
-    let signing_key = {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(new_key.as_bytes());
-        hasher.finalize().to_vec()
-    };
+    let signing_key = baize_server::pipeline::auth::extract_signing_key(&new_key);
     let timestamp = chrono::Utc::now().to_rfc3339();
     let body = r#"{"content":"test","labels":{}}"#;
     let input = format!("{}\nPOST\n/api/v2/blobs\n{}", timestamp, body);
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(&signing_key).unwrap();
-    mac.update(input.as_bytes());
-    let sig = format!("hmac-sha256:{}", hex::encode(mac.finalize().into_bytes()));
+    use ed25519_dalek::{SigningKey, Signer};
+    let sk = SigningKey::from_bytes(&signing_key.try_into().expect("32 bytes"));
+    let sig = sk.sign(input.as_bytes());
+    let sig_str = format!("ed25519:{}", hex::encode(sig.to_bytes()));
     // 签名生成成功（密钥有效）
-    assert!(sig.starts_with("hmac-sha256:"));
+    assert!(sig_str.starts_with("ed25519:"));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Label 归属校验测试
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_label_add_own_blob_ok() {
+    let mut baize = Baize::init_in_memory().unwrap();
+
+    // 注册一个普通 agent
+    baize.agent_register("baize-root", "label-worker", Level(1), vec!["zone-a"], None).unwrap();
+
+    // agent 写入自己的 blob
+    let blob = baize.pipe_blob_write("label-worker", "my data", &labels! {}).unwrap();
+
+    // 给自己的 blob 添加 label — 应该成功
+    let result = baize.pipe_label_add("label-worker", &blob.hash, "env", "test");
+    assert!(result.is_ok(), "agent should be able to label own blob: {:?}", result);
+}
+
+#[test]
+fn test_label_add_not_owner_rejected() {
+    let mut baize = Baize::init_in_memory().unwrap();
+
+    // 注册两个 agent
+    baize.agent_register("baize-root", "owner-agent", Level(1), vec!["zone-a"], None).unwrap();
+    baize.agent_register("baize-root", "other-agent", Level(1), vec!["zone-a"], None).unwrap();
+
+    // owner 写入 blob
+    let blob = baize.pipe_blob_write("owner-agent", "secret data", &labels! {}).unwrap();
+
+    // other-agent 尝试给 owner 的 blob 加 label — 应该被拒
+    let result = baize.pipe_label_add("other-agent", &blob.hash, "env", "stolen");
+    assert!(result.is_err(), "non-owner should not be able to label another agent's blob");
+    match result.unwrap_err() {
+        baize_core::error::Error::PermissionDenied(msg) => {
+            assert!(msg.contains("not owner"), "error should mention ownership: {}", msg);
+        }
+        other => panic!("expected PermissionDenied, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_label_add_root_bypass() {
+    let mut baize = Baize::init_in_memory().unwrap();
+
+    // 注册普通 agent 并写入 blob
+    baize.agent_register("baize-root", "normal-agent", Level(1), vec!["zone-a"], None).unwrap();
+    let blob = baize.pipe_blob_write("normal-agent", "agent data", &labels! {}).unwrap();
+
+    // root 给 agent 的 blob 加 label — 应该成功（root 豁免）
+    let result = baize.pipe_label_add("baize-root", &blob.hash, "reviewed", "true");
+    assert!(result.is_ok(), "root should bypass ownership check: {:?}", result);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// pipe_import trust_level + source 校验测试
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_import_trust_level_exceeds_agent_level_rejected() {
+    let mut baize = Baize::init_in_memory().unwrap();
+
+    // 注册 Level 1 agent
+    baize.agent_register("baize-root", "importer", Level(1), vec!["zone-a"], None).unwrap();
+
+    // 尝试用 trust_level=3（超过自身 level=1）import
+    let result = baize.pipe_import("importer", "external data", "https://example.com", 3, None);
+    assert!(result.is_err(), "trust_level exceeding agent level should be rejected");
+    match result.unwrap_err() {
+        baize_core::error::Error::Validation(msg) => {
+            assert!(msg.contains("trust_level"), "error should mention trust_level: {}", msg);
+        }
+        other => panic!("expected Validation, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_import_empty_source_rejected() {
+    let mut baize = Baize::init_in_memory().unwrap();
+
+    baize.agent_register("baize-root", "importer2", Level(2), vec!["zone-a"], None).unwrap();
+
+    // 空 source
+    let result = baize.pipe_import("importer2", "data", "", 1, None);
+    assert!(result.is_err(), "empty source should be rejected");
+    match result.unwrap_err() {
+        baize_core::error::Error::Validation(msg) => {
+            assert!(msg.contains("source"), "error should mention source: {}", msg);
+        }
+        other => panic!("expected Validation, got: {:?}", other),
+    }
+
+    // 纯空格 source
+    let result2 = baize.pipe_import("importer2", "data", "   ", 1, None);
+    assert!(result2.is_err(), "whitespace-only source should be rejected");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 审计 binding context digest 测试
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_audit_records_binding_context_for_l3() {
+    use baize_server::pipeline::agent_manager::PermissionGuard;
+    use baize_asl::payload::RuntimeProofContent;
+
+    let mut baize = Baize::init_in_memory().unwrap();
+
+    // 注册 Level 3 agent
+    baize.agent_register("baize-root", "l3-agent", Level(3), vec!["zone-a"], None).unwrap();
+
+    // 生成有效 proof
+    let cert_filter = {
+        let mut f = HashMap::new();
+        f.insert("type".to_string(), "agent-cert".to_string());
+        f.insert("agent-id".to_string(), "l3-agent".to_string());
+        f
+    };
+    let certs = baize.storage.blob_query(&cert_filter).unwrap();
+    let cert_hash = certs[0].hash.clone();
+    let cert_labels = certs[0].labels.clone();
+
+    let instance_state = serde_json::json!({"instance_id": "l3-agent", "instance_status": "running"});
+    let binding_digest = baize_asl::AslAdapter::compute_binding_context_digest(&cert_labels, &instance_state);
+    let now = chrono::Utc::now();
+    let proof = RuntimeProofContent {
+        proof_id: format!("proof-audit-{}", now.timestamp_millis()),
+        credential_digest: cert_hash,
+        instance_state_attributes: instance_state,
+        binding_context_digest: binding_digest.clone(),
+        proof_anchor_mode: baize_asl::payload::ProofAnchorMode::CredentialAnchored,
+        issued_at: now.to_rfc3339(),
+        expires_at: (now + chrono::Duration::minutes(5)).to_rfc3339(),
+    };
+    let proof_labels = HashMap::from([
+        ("type".to_string(), "runtime-proof".to_string()),
+        (LABEL_PROOF_AGENT.to_string(), "l3-agent".to_string()),
+        (LABEL_PROOF_CREDENTIAL.to_string(), proof.credential_digest.clone()),
+    ]);
+    baize.storage.blob_write(&serde_json::to_string(&proof).unwrap(), &proof_labels).unwrap();
+
+    // L3 agent 执行 blob write（需要 proof）
+    let blob = baize.pipe_blob_write("l3-agent", "sensitive data", &labels! {
+        "type" => "generic",
+    }).unwrap();
+
+    // 查找审计记录，检查是否包含 binding context digest
+    let audit_filter = {
+        let mut f = HashMap::new();
+        f.insert("x-audit-type".to_string(), "blob_write".to_string());
+        f.insert("x-audit-target".to_string(), blob.hash.clone());
+        f
+    };
+    let audit_records = baize.storage.blob_query(&audit_filter).unwrap();
+    assert!(!audit_records.is_empty(), "should have audit record for blob_write");
+
+    let audit = &audit_records[0];
+    let recorded_digest = audit.labels.get(LABEL_BINDING_CONTEXT_DIGEST);
+    assert!(recorded_digest.is_some(), "L3 audit should contain binding context digest");
+    assert_eq!(recorded_digest.unwrap(), &binding_digest, "recorded digest should match proof binding context");
 }

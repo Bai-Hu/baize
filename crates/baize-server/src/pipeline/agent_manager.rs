@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use baize_core::cert::{CertBundle, CertIdentity, CertTool, CredentialStatus};
 use baize_core::error::Error;
+use baize_core::identity::IdentityProvider;
 use baize_core::labels::*;
 use baize_core::scope::{Level, Scope};
 use baize_core::ROOT_AGENT_ID;
@@ -9,12 +10,14 @@ use baize_core::ROOT_AGENT_ID;
 use crate::hook::HookContext;
 use super::Baize;
 use super::auditor::Auditor;
+use super::identity::CertIdentityProvider;
 
 /// Agent 管理接口：注册、撤销、列表、身份追溯
 pub trait AgentRegistry {
     /// 注册 Agent
     fn agent_register(
         &mut self,
+        caller_id: &str,
         name: &str,
         level: Level,
         zones: Vec<&str>,
@@ -22,7 +25,7 @@ pub trait AgentRegistry {
     ) -> Result<(String, CertBundle), Error>;
 
     /// 撤销 Agent
-    fn agent_revoke(&mut self, agent_id: &str) -> Result<(), Error>;
+    fn agent_revoke(&mut self, caller_id: &str, agent_id: &str) -> Result<(), Error>;
 
     /// 列出所有 Agent
     fn agent_list(&self) -> Vec<(String, CertIdentity)>;
@@ -34,7 +37,6 @@ pub trait AgentRegistry {
     fn credential_status(&self, agent_id: &str) -> Result<CredentialStatus, Error>;
 
     /// 更新凭证状态（IDN-LCM）
-    /// 状态机：Active → Suspended/Revoked, Suspended → Active/Revoked/Decommissioned
     fn update_credential_status(
         &mut self,
         agent_id: &str,
@@ -58,9 +60,15 @@ pub trait PermissionGuard {
     fn require_valid_proof(&self, agent_id: &str) -> Result<baize_asl::payload::RuntimeProofContent, Error>;
 }
 
+/// 获取 CertIdentityProvider（从 dyn IdentityProvider downcast）
+fn cert_provider(identity: &dyn IdentityProvider) -> Option<&CertIdentityProvider> {
+    identity.as_any().downcast_ref::<CertIdentityProvider>()
+}
+
 impl AgentRegistry for Baize {
     fn agent_register(
         &mut self,
+        caller_id: &str,
         name: &str,
         level: Level,
         zones: Vec<&str>,
@@ -68,10 +76,17 @@ impl AgentRegistry for Baize {
     ) -> Result<(String, CertBundle), Error> {
         let scope = Scope::new(level, zones)?;
 
-        // Pre-hook: 验证身份
+        // 权限校验：调用者必须是 root 或指定的 parent
         let issuer_agent_id = parent_id.unwrap_or(ROOT_AGENT_ID);
-        let issuer_identity = self.agents.get(issuer_agent_id)
-            .map(|(id, _)| id.clone());
+        if caller_id != ROOT_AGENT_ID && caller_id != issuer_agent_id {
+            return Err(Error::PermissionDenied(format!(
+                "agent '{}' cannot register child under '{}' (must be root or parent)",
+                caller_id, issuer_agent_id
+            )));
+        }
+
+        // Pre-hook: 验证身份
+        let issuer_identity = self.identity.get_identity(issuer_agent_id);
         let ctx = HookContext {
             agent_id: issuer_agent_id.to_string(),
             identity: issuer_identity,
@@ -87,9 +102,17 @@ impl AgentRegistry for Baize {
             ));
         }
 
+        // 使用 CertIdentityProvider 签发证书（需要 IssuerCtx）
+        let provider = cert_provider(self.identity.as_ref())
+            .ok_or_else(|| Error::Validation(
+                "agent registration requires CertIdentityProvider; \
+                 custom identity providers must implement their own registration logic".into()
+            ))?;
+
         // 验证 scope 递减
         if parent_id.is_some() {
-            if let Some((parent_identity, _)) = self.agents.get(issuer_agent_id) {
+            let parent_identity = provider.get_cert_identity(issuer_agent_id);
+            if let Some(parent_identity) = parent_identity {
                 let parent_scope = Scope::new(
                     Level(parent_identity.level),
                     parent_identity.zones.iter().map(|s| s.as_str()),
@@ -98,18 +121,15 @@ impl AgentRegistry for Baize {
             }
         }
 
-        // 获取签发者上下文
-        let issuer_entry = self.agents.get(issuer_agent_id)
-            .ok_or_else(|| Error::NotFound(format!("issuer agent {}", issuer_agent_id)))?;
-        let issuer_ctx = &issuer_entry.1;
-
-        // 签发证书
-        let (bundle, agent_ctx) = CertTool::issue_agent(
-            name,
-            &scope,
-            issuer_ctx,
-            Some(issuer_agent_id),
-        )?;
+        // 获取签发者上下文并签发证书
+        let (bundle, agent_ctx) = provider.with_issuer(issuer_agent_id, |_identity, issuer_ctx| {
+            CertTool::issue_agent(
+                name,
+                &scope,
+                issuer_ctx,
+                Some(issuer_agent_id),
+            )
+        })?;
 
         let identity = bundle.identity.clone();
 
@@ -117,12 +137,10 @@ impl AgentRegistry for Baize {
         let mut cert_labels = labels! {
             "type" => "agent-cert",
             "agent-id" => name,
-            // IDN-ATT 主体状态属性
             LABEL_CERT_AGENT => name,
             LABEL_CERT_LEVEL => &scope.level.0.to_string(),
             LABEL_CERT_STATUS => &CredentialStatus::Active.to_string(),
             LABEL_CERT_ZONES => &scope.zones.iter().cloned().collect::<Vec<_>>().join(","),
-            // IDN-ATT 环境属性（默认 SEE-L1：普通 Linux 环境）
             LABEL_SEE_LEVEL => "L1",
             LABEL_SEE_ENV_ID => "default",
             LABEL_SEE_PLATFORM_STATE => "unknown",
@@ -137,21 +155,19 @@ impl AgentRegistry for Baize {
         self.storage.blob_write(&bundle.cert_pem, &cert_labels)?;
 
         // INF-KMS：为每种密钥用途创建独立的 agent-key blob
-        // IDN_SIGN 复用签发证书的密钥（recover_issuer 需要此密钥恢复签发能力）
-        // 其他用途各自生成独立密钥
-        // 私钥使用 AES-256-GCM 加密存储（如有 master secret）
         let master_secret = baize_core::crypto::master_secret_from_env();
         for purpose in KEY_PURPOSES {
             let (key_pem, algorithm) = if purpose == &"IDN_SIGN" {
                 (bundle.key_pem.clone(), "Ed25519")
             } else if purpose == &"SESSION" {
-                let (priv_pem, _) = baize_core::crypto::generate_x25519_keypair()?;
+                let (priv_pem, _) = self.crypto.key_exchange.generate_keypair()?;
                 (priv_pem, "X25519")
             } else {
-                (CertTool::generate_key_pair()?, "Ed25519")
+                let (priv_pem, _) = baize_core::crypto::generate_ed25519_keypair()?;
+                (priv_pem, "Ed25519")
             };
-            let stored_key = if let Some(ref secret) = master_secret {
-                baize_core::crypto::encrypt_key(&key_pem, secret)?
+            let stored_key: String = if let Some(ref secret) = master_secret {
+                self.crypto.key_encryption.encrypt(&key_pem, secret)?
             } else {
                 key_pem
             };
@@ -176,17 +192,30 @@ impl AgentRegistry for Baize {
         // Post-hook
         self.hooks.run_post(&ctx, &hook_result);
 
-        self.agents.insert(name.to_string(), (identity, agent_ctx));
+        // 插入到 provider 内存
+        provider.insert_agent(name.to_string(), identity, agent_ctx);
 
         Ok((name.to_string(), bundle))
     }
 
-    fn agent_revoke(&mut self, agent_id: &str) -> Result<(), Error> {
-        if !self.agents.contains_key(agent_id) {
+    fn agent_revoke(&mut self, caller_id: &str, agent_id: &str) -> Result<(), Error> {
+        if !self.identity.contains(agent_id) {
             return Err(Error::NotFound(format!("agent {}", agent_id)));
         }
         if agent_id == ROOT_AGENT_ID {
             return Err(Error::PermissionDenied("cannot revoke root".into()));
+        }
+
+        // 权限校验：调用者必须是 root 或目标 agent 的 parent
+        if caller_id != ROOT_AGENT_ID {
+            let target_identity = self.identity.get_identity(agent_id)
+                .ok_or_else(|| Error::NotFound(format!("agent {}", agent_id)))?;
+            if target_identity.parent_id.as_deref() != Some(caller_id) {
+                return Err(Error::PermissionDenied(format!(
+                    "agent '{}' cannot revoke '{}' (must be root or parent)",
+                    caller_id, agent_id
+                )));
+            }
         }
 
         // 销毁 workspace
@@ -201,7 +230,7 @@ impl AgentRegistry for Baize {
             let _ = self.storage.label_add(&cert_blob.hash, "revoked", "true");
         }
 
-        // INF-KMS：标记所有 agent-key blob 为已撤销（密钥销毁）
+        // INF-KMS：标记所有 agent-key blob 为已撤销
         let mut key_filter = HashMap::new();
         key_filter.insert("type".to_string(), "agent-key".to_string());
         key_filter.insert("agent-id".to_string(), agent_id.to_string());
@@ -212,8 +241,10 @@ impl AgentRegistry for Baize {
             }
         }
 
-        // 移除 agent
-        self.agents.remove(agent_id);
+        // 从 provider 移除
+        if let Some(provider) = cert_provider(self.identity.as_ref()) {
+            provider.remove_agent(agent_id);
+        }
 
         // 审计
         self.audit("agent_revoke", agent_id, "success", Some(agent_id))?;
@@ -222,35 +253,23 @@ impl AgentRegistry for Baize {
     }
 
     fn agent_list(&self) -> Vec<(String, CertIdentity)> {
-        self.agents.iter()
-            .map(|(id, (identity, _))| (id.clone(), identity.clone()))
-            .collect()
+        if let Some(provider) = cert_provider(self.identity.as_ref()) {
+            provider.list_cert_identities()
+        } else {
+            // 非 CertIdentityProvider：从 AgentIdentity 转换
+            self.identity.list().into_iter()
+                .map(|(id, agent_id)| (id, agent_id.into()))
+                .collect()
+        }
     }
 
     fn trace_identity(&self, agent_id: &str) -> Result<Vec<CertIdentity>, Error> {
-        let (identity, _) = self.agents.get(agent_id)
-            .ok_or_else(|| Error::NotFound(format!("agent {}", agent_id)))?;
-
-        let mut chain = vec![identity.clone()];
-        let mut current = identity.parent_id.clone();
-
-        while let Some(parent_id) = current {
-            if let Some((parent_identity, _)) = self.agents.get(&parent_id) {
-                current = parent_identity.parent_id.clone();
-                chain.push(parent_identity.clone());
-            } else {
-                break;
-            }
-        }
-
-        Ok(chain)
+        let chain = self.identity.trace_identity(agent_id)?;
+        Ok(chain.into_iter().map(Into::into).collect())
     }
 
     fn credential_status(&self, agent_id: &str) -> Result<CredentialStatus, Error> {
-        let (identity, _) = self.agents.get(agent_id)
-            .ok_or_else(|| Error::NotFound(format!("agent {}", agent_id)))?;
-        // 优先从内存状态返回（内存状态由 init 恢复和 update_credential_status 维护）
-        Ok(identity.status)
+        self.identity.credential_status(agent_id)
     }
 
     fn update_credential_status(
@@ -263,47 +282,21 @@ impl AgentRegistry for Baize {
             return Err(Error::PermissionDenied("cannot change root credential status".into()));
         }
 
-        let current = {
-            let (identity, _) = self.agents.get(agent_id)
-                .ok_or_else(|| Error::NotFound(format!("agent {}", agent_id)))?;
-            identity.status
-        };
-        Self::validate_status_transition(current, new_status)?;
+        let current = self.identity.credential_status(agent_id)?;
 
-        // 更新内存中的状态
-        if let Some((identity, _)) = self.agents.get_mut(agent_id) {
-            identity.status = new_status;
-        }
+        // 委托给 identity provider 更新（含持久化 + 内存状态更新，但不移除 agent）
+        self.identity.update_status(agent_id, new_status, reason, self.store())?;
 
-        // 持久化：在 agent-cert blob 上追加状态标志 label（append-only）
-        // init 恢复时通过 recover_credential_status 按优先级判断状态：
-        // revoked > decommissioned > suspended > active（无负面 label 即 active）
-        // 因此恢复 active 时不追加 label，只需更新内存状态
-        let mut cert_filter = HashMap::new();
-        cert_filter.insert("type".to_string(), "agent-cert".to_string());
-        cert_filter.insert("agent-id".to_string(), agent_id.to_string());
-        let cert_blobs = self.storage.blob_query(&cert_filter)?;
-        if let Some(cert_blob) = cert_blobs.first() {
-            let label_key = match new_status {
-                CredentialStatus::Suspended => LABEL_CERT_SUSPENDED,
-                CredentialStatus::Revoked => LABEL_CERT_REVOKED,
-                CredentialStatus::Expired => LABEL_CERT_EXPIRED,
-                CredentialStatus::Active => {
-                    // 恢复 active：无需追加 label，init 恢复时无负面 label 即为 active
-                    self.audit("credential_status_change", agent_id, &format!("{:?}→{:?}: {}", current, new_status, reason), Some(agent_id))?;
-                    return Ok(());
-                }
-            };
-            self.storage.label_add(&cert_blob.hash, label_key, "true")?;
-        }
+        // 审计（必须在 agent 移除之前，否则 get_identity 返回 None 导致审计标签缺失）
+        self.audit("credential_status_change", agent_id, &format!("{:?}→{:?}: {}", current, new_status, reason), Some(agent_id))?;
 
-        // revoked / expired agent：销毁 workspace 并从活跃列表移除
+        // revoked / expired：审计完成后销毁 workspace + 从活跃列表移除
         if new_status == CredentialStatus::Revoked || new_status == CredentialStatus::Expired {
             let _ = self.workspace_mgr.destroy(agent_id);
-            self.agents.remove(agent_id);
+            if let Some(provider) = cert_provider(self.identity.as_ref()) {
+                provider.remove_agent(agent_id);
+            }
         }
-
-        self.audit("credential_status_change", agent_id, &format!("{:?}→{:?}: {}", current, new_status, reason), Some(agent_id))?;
 
         Ok(())
     }
@@ -320,10 +313,14 @@ pub trait KmsManager {
 
 impl KmsManager for Baize {
     fn kms_get_active_key(&self, agent_id: &str, purpose: &str) -> Result<String, Error> {
-        let (identity, _) = self.agents.get(agent_id)
-            .ok_or_else(|| Error::NotFound(format!("agent {}", agent_id)))?;
-        if identity.status != CredentialStatus::Active {
-            return Err(Error::PermissionDenied(format!("agent {} is not active (status: {})", agent_id, identity.status)));
+        if purpose == "IDN_SIGN" {
+            return self.identity.get_signing_key(agent_id, self.store(), &self.crypto);
+        }
+
+        // 非 IDN_SIGN 用途：直接查询 storage
+        let status = self.identity.credential_status(agent_id)?;
+        if status != CredentialStatus::Active {
+            return Err(Error::PermissionDenied(format!("agent {} is not active (status: {})", agent_id, status)));
         }
 
         let mut filter = HashMap::new();
@@ -339,7 +336,7 @@ impl KmsManager for Baize {
         )))?;
 
         let pem = if let Some(secret) = baize_core::crypto::master_secret_from_env() {
-            baize_core::crypto::decrypt_key(&active_key.content, &secret)?
+            self.crypto.key_encryption.decrypt(&active_key.content, &secret)?
         } else {
             active_key.content.clone()
         };
@@ -348,24 +345,18 @@ impl KmsManager for Baize {
     }
 
     fn kms_rotate_key(&mut self, agent_id: &str, purpose: &str) -> Result<String, Error> {
-        // 并发安全：Baize 实例由 tokio::sync::Mutex 保护（AppState = Arc<Mutex<Baize>>），
-        // 同一时间只有一个请求能进入此方法，不存在并发轮换的竞态条件。
-        // 如果未来引入多实例部署，需要在此处加分布式锁或数据库乐观锁。
         if agent_id == ROOT_AGENT_ID {
             return Err(Error::PermissionDenied("cannot rotate root keys".into()));
         }
-        let (identity, _) = self.agents.get(agent_id)
-            .ok_or_else(|| Error::NotFound(format!("agent {}", agent_id)))?;
-        if identity.status != CredentialStatus::Active {
+        let status = self.identity.credential_status(agent_id)?;
+        if status != CredentialStatus::Active {
             return Err(Error::PermissionDenied(
-                format!("agent {} is not active (status: {}), cannot rotate keys", agent_id, identity.status)
+                format!("agent {} is not active (status: {}), cannot rotate keys", agent_id, status)
             ));
         }
         if !KEY_PURPOSES.contains(&purpose) {
             return Err(Error::Validation(format!("invalid key purpose: {}", purpose)));
         }
-
-        let master_secret = baize_core::crypto::master_secret_from_env();
 
         // 撤销当前活跃 key
         let mut filter = HashMap::new();
@@ -382,15 +373,17 @@ impl KmsManager for Baize {
 
         // 生成新 key
         let (key_pem, algorithm) = if purpose == "SESSION" {
-            let (priv_pem, _) = baize_core::crypto::generate_x25519_keypair()?;
+            let (priv_pem, _) = self.crypto.key_exchange.generate_keypair()?;
             (priv_pem, "X25519")
         } else {
-            (CertTool::generate_key_pair()?, "Ed25519")
+            let (priv_pem, _) = baize_core::crypto::generate_ed25519_keypair()?;
+            (priv_pem, "Ed25519")
         };
 
         // 加密并存储
+        let master_secret = baize_core::crypto::master_secret_from_env();
         let stored_key = if let Some(ref secret) = master_secret {
-            baize_core::crypto::encrypt_key(&key_pem, secret)?
+            self.crypto.key_encryption.encrypt(&key_pem, secret)?
         } else {
             key_pem.clone()
         };
@@ -408,19 +401,7 @@ impl KmsManager for Baize {
 
         // IDN_SIGN 轮换时更新内存中 IssuerCtx
         if purpose == "IDN_SIGN" {
-            let identity = self.agents.get(agent_id)
-                .map(|(id, _)| id.clone());
-            if let Some(identity) = identity {
-                let mut cert_filter = HashMap::new();
-                cert_filter.insert("type".to_string(), "agent-cert".to_string());
-                cert_filter.insert("agent-id".to_string(), agent_id.to_string());
-                let certs = self.storage.blob_query(&cert_filter)?;
-                if let Some(cert_blob) = certs.first() {
-                    if let Ok(new_ctx) = CertTool::recover_issuer(&cert_blob.content, &key_pem) {
-                        self.agents.insert(agent_id.to_string(), (identity, new_ctx));
-                    }
-                }
-            }
+            self.identity.update_signing_key(agent_id, &key_pem, self.store())?;
         }
 
         self.audit("key_rotate", agent_id, &format!("purpose={}", purpose), Some(agent_id))?;
@@ -429,55 +410,20 @@ impl KmsManager for Baize {
     }
 }
 
-impl Baize {
-    /// 凭证状态迁移校验（对齐 PROTOCOL_SPEC_V1 §7.3）
-    /// Active → Suspended, Revoked, Expired
-    /// Suspended → Active, Revoked, Expired
-    /// 任意 → Expired（自然过期）
-    /// Revoked / Expired → (terminal)
-    fn validate_status_transition(
-        from: CredentialStatus,
-        to: CredentialStatus,
-    ) -> Result<(), Error> {
-        let valid = match (from, to) {
-            // 同状态幂等
-            (a, b) if a == b => true,
-            // Active → Suspended / Revoked
-            (CredentialStatus::Active, CredentialStatus::Suspended) => true,
-            (CredentialStatus::Active, CredentialStatus::Revoked) => true,
-            // Suspended → Active / Revoked
-            (CredentialStatus::Suspended, CredentialStatus::Active) => true,
-            (CredentialStatus::Suspended, CredentialStatus::Revoked) => true,
-            // 任意 → Expired（自然过期，终态）
-            (_, CredentialStatus::Expired) => true,
-            // 终态不可逆
-            _ => false,
-        };
-
-        if !valid {
-            return Err(Error::Validation(
-                format!("invalid credential status transition: {:?} → {:?}", from, to)
-            ));
-        }
-        Ok(())
-    }
-}
-
 impl PermissionGuard for Baize {
     fn verify_write_agent(&self, agent_id: &str) -> Result<CertIdentity, Error> {
-        let (identity, _) = self.agents.get(agent_id)
+        let agent_identity = self.identity.get_identity(agent_id)
             .ok_or_else(|| Error::NeedUserDecision(
                 format!("agent '{}' not found. Register the agent first.", agent_id)
             ))?;
 
-        if identity.level < 1 {
+        if agent_identity.level < 1 {
             return Err(Error::PermissionDenied(
                 format!("agent {} is Level 0 (sandbox), cannot write. Need elevation to Level >= 1.", agent_id)
             ));
         }
 
-        // v2: 凭证状态检查
-        match identity.status {
+        match agent_identity.status {
             CredentialStatus::Active => {},
             CredentialStatus::Suspended => return Err(Error::PermissionDenied(
                 format!("agent {} is suspended", agent_id)
@@ -490,17 +436,16 @@ impl PermissionGuard for Baize {
             )),
         }
 
-        Ok(identity.clone())
+        Ok(agent_identity.into())
     }
 
     fn verify_read_agent(&self, agent_id: &str) -> Result<CertIdentity, Error> {
-        let (identity, _) = self.agents.get(agent_id)
+        let agent_identity = self.identity.get_identity(agent_id)
             .ok_or_else(|| Error::NeedUserDecision(
                 format!("agent '{}' not found. Register the agent first.", agent_id)
             ))?;
 
-        // v2: revoked/expired 不允许读取
-        match identity.status {
+        match agent_identity.status {
             CredentialStatus::Active | CredentialStatus::Suspended => {},
             CredentialStatus::Revoked => return Err(Error::CredentialExpired(
                 format!("agent {} is revoked", agent_id)
@@ -510,7 +455,7 @@ impl PermissionGuard for Baize {
             )),
         }
 
-        Ok(identity.clone())
+        Ok(agent_identity.into())
     }
 
     fn verify_file_zone(identity: &CertIdentity, path: &str) -> Result<(), Error> {
@@ -675,7 +620,7 @@ mod v1_tests {
     #[test]
     fn agent_register_creates_5_key_blobs() {
         let mut baize = setup();
-        baize.agent_register("kms-agent", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "kms-agent", Level(2), vec!["A"], None).unwrap();
 
         let mut filter = HashMap::new();
         filter.insert("type".to_string(), "agent-key".to_string());
@@ -688,7 +633,7 @@ mod v1_tests {
     #[test]
     fn agent_key_purposes_are_correct() {
         let mut baize = setup();
-        baize.agent_register("purpose-agent", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "purpose-agent", Level(2), vec!["A"], None).unwrap();
 
         for purpose in KEY_PURPOSES {
             let mut filter = HashMap::new();
@@ -713,7 +658,7 @@ mod v1_tests {
     #[test]
     fn agent_cert_has_idn_att_labels() {
         let mut baize = setup();
-        baize.agent_register("att-agent", Level(3), vec!["A", "B"], None).unwrap();
+        baize.agent_register("baize-root", "att-agent", Level(3), vec!["A", "B"], None).unwrap();
 
         let mut filter = HashMap::new();
         filter.insert("type".to_string(), "agent-cert".to_string());
@@ -734,7 +679,7 @@ mod v1_tests {
     #[test]
     fn agent_cert_has_see_labels() {
         let mut baize = setup();
-        baize.agent_register("see-agent", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "see-agent", Level(2), vec!["A"], None).unwrap();
 
         let mut filter = HashMap::new();
         filter.insert("type".to_string(), "agent-cert".to_string());
@@ -752,8 +697,8 @@ mod v1_tests {
     #[test]
     fn child_agent_has_parent_label() {
         let mut baize = setup();
-        baize.agent_register("parent", Level(3), vec!["A", "B"], None).unwrap();
-        baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
+        baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B"], None).unwrap();
+        baize.agent_register("baize-root", "child", Level(2), vec!["A"], Some("parent")).unwrap();
 
         let mut filter = HashMap::new();
         filter.insert("type".to_string(), "agent-cert".to_string());
@@ -770,7 +715,7 @@ mod v1_tests {
     #[test]
     fn credential_status_default_is_active() {
         let mut baize = setup();
-        baize.agent_register("lcm-agent", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "lcm-agent", Level(2), vec!["A"], None).unwrap();
         let status = baize.credential_status("lcm-agent").unwrap();
         assert_eq!(status, CredentialStatus::Active);
     }
@@ -778,7 +723,7 @@ mod v1_tests {
     #[test]
     fn suspend_active_agent() {
         let mut baize = setup();
-        baize.agent_register("target", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "target", Level(2), vec!["A"], None).unwrap();
 
         baize.update_credential_status("target", CredentialStatus::Suspended, "security review").unwrap();
         assert_eq!(baize.credential_status("target").unwrap(), CredentialStatus::Suspended);
@@ -787,7 +732,7 @@ mod v1_tests {
     #[test]
     fn revoke_active_agent() {
         let mut baize = setup();
-        baize.agent_register("target", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "target", Level(2), vec!["A"], None).unwrap();
 
         baize.update_credential_status("target", CredentialStatus::Revoked, "compromised").unwrap();
         // revoked agent removed from active list
@@ -797,7 +742,7 @@ mod v1_tests {
     #[test]
     fn reactivate_suspended_agent() {
         let mut baize = setup();
-        baize.agent_register("target", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "target", Level(2), vec!["A"], None).unwrap();
 
         baize.update_credential_status("target", CredentialStatus::Suspended, "review").unwrap();
         baize.update_credential_status("target", CredentialStatus::Active, "cleared").unwrap();
@@ -807,7 +752,7 @@ mod v1_tests {
     #[test]
     fn expire_suspended_agent() {
         let mut baize = setup();
-        baize.agent_register("target", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "target", Level(2), vec!["A"], None).unwrap();
 
         baize.update_credential_status("target", CredentialStatus::Suspended, "review").unwrap();
         baize.update_credential_status("target", CredentialStatus::Expired, "timeout").unwrap();
@@ -819,7 +764,7 @@ mod v1_tests {
     fn expire_active_agent() {
         // 协议 §7.3：任意 → expired
         let mut baize = setup();
-        baize.agent_register("target", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "target", Level(2), vec!["A"], None).unwrap();
 
         baize.update_credential_status("target", CredentialStatus::Expired, "natural expiry").unwrap();
         assert!(baize.credential_status("target").is_err());
@@ -829,7 +774,7 @@ mod v1_tests {
     fn invalid_transition_active_to_active_ok() {
         // 幂等：同状态转换应成功
         let mut baize = setup();
-        baize.agent_register("target", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "target", Level(2), vec!["A"], None).unwrap();
         let result = baize.update_credential_status("target", CredentialStatus::Active, "no-op");
         assert!(result.is_ok());
     }
@@ -837,7 +782,7 @@ mod v1_tests {
     #[test]
     fn invalid_transition_revoked_to_active_fails() {
         let mut baize = setup();
-        baize.agent_register("target", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "target", Level(2), vec!["A"], None).unwrap();
         baize.update_credential_status("target", CredentialStatus::Revoked, "compromised").unwrap();
         // target already removed, so this should fail with NotFound
         assert!(baize.credential_status("target").is_err());
@@ -853,7 +798,7 @@ mod v1_tests {
     #[test]
     fn status_suspended_persists_label() {
         let mut baize = setup();
-        baize.agent_register("persist", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "persist", Level(2), vec!["A"], None).unwrap();
         baize.update_credential_status("persist", CredentialStatus::Suspended, "audit").unwrap();
 
         // 直接查询 cert blob 的 labels 验证持久化
@@ -872,8 +817,8 @@ mod v1_tests {
     #[test]
     fn trace_identity_includes_status() {
         let mut baize = setup();
-        baize.agent_register("parent", Level(3), vec!["A", "B"], None).unwrap();
-        baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
+        baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B"], None).unwrap();
+        baize.agent_register("baize-root", "child", Level(2), vec!["A"], Some("parent")).unwrap();
 
         let chain = baize.trace_identity("child").unwrap();
         assert_eq!(chain.len(), 3);
@@ -886,8 +831,8 @@ mod v1_tests {
     #[test]
     fn trace_identity_shows_suspended_status() {
         let mut baize = setup();
-        baize.agent_register("parent", Level(3), vec!["A"], None).unwrap();
-        baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
+        baize.agent_register("baize-root", "parent", Level(3), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "child", Level(2), vec!["A"], Some("parent")).unwrap();
 
         // suspend parent
         baize.update_credential_status("parent", CredentialStatus::Suspended, "review").unwrap();
@@ -904,7 +849,7 @@ mod v1_tests {
     #[test]
     fn key_rotation_creates_new_key() {
         let mut baize = setup();
-        baize.agent_register("rot-agent", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "rot-agent", Level(2), vec!["A"], None).unwrap();
 
         let old_hash = {
             let mut f = HashMap::new();
@@ -922,7 +867,7 @@ mod v1_tests {
     #[test]
     fn key_rotation_revokes_old_key() {
         let mut baize = setup();
-        baize.agent_register("rot-agent", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "rot-agent", Level(2), vec!["A"], None).unwrap();
 
         baize.kms_rotate_key("rot-agent", "INT_SIGN").unwrap();
 
@@ -943,13 +888,13 @@ mod v1_tests {
     #[test]
     fn key_rotation_idn_sign_updates_issuer_ctx() {
         let mut baize = setup();
-        baize.agent_register("parent", Level(3), vec!["A", "B"], None).unwrap();
+        baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B"], None).unwrap();
 
         baize.kms_rotate_key("parent", "IDN_SIGN").unwrap();
 
         // 轮换后 parent 应仍能签发子 agent
-        baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
-        assert!(baize.agents.contains_key("child"));
+        baize.agent_register("baize-root", "child", Level(2), vec!["A"], Some("parent")).unwrap();
+        assert!(baize.identity.contains("child"));
     }
 
     #[test]
@@ -973,7 +918,7 @@ mod v1_tests {
     #[test]
     fn rotate_invalid_purpose_fails() {
         let mut baize = setup();
-        baize.agent_register("rot-agent", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "rot-agent", Level(2), vec!["A"], None).unwrap();
         let result = baize.kms_rotate_key("rot-agent", "INVALID_PURPOSE");
         assert!(result.is_err());
         match result {
@@ -985,8 +930,8 @@ mod v1_tests {
     #[test]
     fn revoke_destroys_all_keys() {
         let mut baize = setup();
-        baize.agent_register("doomed", Level(2), vec!["A"], None).unwrap();
-        baize.agent_revoke("doomed").unwrap();
+        baize.agent_register("baize-root", "doomed", Level(2), vec!["A"], None).unwrap();
+        baize.agent_revoke("baize-root", "doomed").unwrap();
 
         let mut f = HashMap::new();
         f.insert("type".into(), "agent-key".into());
@@ -1003,7 +948,7 @@ mod v1_tests {
     #[test]
     fn kms_get_active_key_excludes_revoked() {
         let mut baize = setup();
-        baize.agent_register("key-agent", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "key-agent", Level(2), vec!["A"], None).unwrap();
 
         let old_key = baize.kms_get_active_key("key-agent", "IDN_SIGN").unwrap();
         baize.kms_rotate_key("key-agent", "IDN_SIGN").unwrap();
@@ -1015,8 +960,8 @@ mod v1_tests {
     #[test]
     fn kms_get_active_key_no_revoked_returns_not_found() {
         let mut baize = setup();
-        baize.agent_register("temp", Level(2), vec!["A"], None).unwrap();
-        baize.agent_revoke("temp").unwrap();
+        baize.agent_register("baize-root", "temp", Level(2), vec!["A"], None).unwrap();
+        baize.agent_revoke("baize-root", "temp").unwrap();
 
         let result = baize.kms_get_active_key("temp", "IDN_SIGN");
         assert!(result.is_err(), "revoked agent should have no active key");
@@ -1060,7 +1005,7 @@ mod v1_tests {
     #[test]
     fn require_valid_proof_no_proof_fails() {
         let mut baize = setup();
-        baize.agent_register("prover", Level(3), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "prover", Level(3), vec!["A"], None).unwrap();
 
         let result = baize.require_valid_proof("prover");
         assert!(result.is_err());
@@ -1073,7 +1018,7 @@ mod v1_tests {
     #[test]
     fn require_valid_proof_expired_proof_fails() {
         let mut baize = setup();
-        baize.agent_register("prover", Level(3), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "prover", Level(3), vec!["A"], None).unwrap();
 
         // 写一个已过期的 proof
         let mut cert_filter = HashMap::new();
@@ -1116,7 +1061,7 @@ mod v1_tests {
     #[test]
     fn require_valid_proof_credential_mismatch_fails() {
         let mut baize = setup();
-        baize.agent_register("prover", Level(3), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "prover", Level(3), vec!["A"], None).unwrap();
 
         let mut cert_filter = HashMap::new();
         cert_filter.insert("type".to_string(), "agent-cert".to_string());
@@ -1157,7 +1102,7 @@ mod v1_tests {
     #[test]
     fn require_valid_proof_valid_succeeds() {
         let mut baize = setup();
-        baize.agent_register("prover", Level(3), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "prover", Level(3), vec!["A"], None).unwrap();
 
         write_valid_proof(&mut baize, "prover");
 
@@ -1169,7 +1114,7 @@ mod v1_tests {
     #[test]
     fn require_valid_proof_selects_latest() {
         let mut baize = setup();
-        baize.agent_register("prover", Level(3), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "prover", Level(3), vec!["A"], None).unwrap();
 
         let mut cert_filter = HashMap::new();
         cert_filter.insert("type".to_string(), "agent-cert".to_string());

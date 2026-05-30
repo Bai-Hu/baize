@@ -67,10 +67,12 @@ impl Scope {
             .map(|s| s.as_str())
             .collect();
         if !overflow.is_empty() {
+            let parent_zones: Vec<String> = parent.zones.iter().cloned().collect();
             return Err(Error::Validation(format!(
-                "child zones {:?} exceed parent zones {:?}",
-                overflow,
-                parent.zones
+                "zones not allowed: [{}] not in parent zones [{}]. \
+                 Child agent zones must be a subset of parent zones",
+                overflow.join(", "),
+                parent_zones.join(", "),
             )));
         }
 

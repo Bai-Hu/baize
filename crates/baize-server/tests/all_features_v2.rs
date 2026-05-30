@@ -5,6 +5,7 @@
 mod common;
 use common::*;
 use axum::body::Body;
+use baize_core::crypto::CryptoProvider;
 use serde_json::{json, Value};
 use http::{Request, StatusCode};
 
@@ -195,7 +196,7 @@ async fn v2_expired_timestamp_fails() {
     let (app, key) = setup_signed_agent("v2old", 2, &["A"]);
     let body_str = serde_json::to_string(&json!({"content": "old", "labels": {"type": "generic"}})).unwrap();
     let old_ts = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
-    let sig = baize_server::pipeline::auth::compute_signature(&key, &old_ts, "POST", "/api/v2/blobs", &body_str);
+    let sig = baize_server::pipeline::auth::compute_signature(CryptoProvider::default().request_signer.as_ref(), &key, &old_ts, "POST", "/api/v2/blobs", &body_str);
 
     let req = Request::builder()
         .method("POST").uri("/api/v2/blobs")

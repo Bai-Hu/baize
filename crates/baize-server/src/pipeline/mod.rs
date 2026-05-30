@@ -1,10 +1,11 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use baize_core::cert::{CertIdentity, CertTool, CredentialStatus};
+use baize_core::crypto::CryptoProvider;
 use baize_core::error::Error;
-use baize_core::labels::*;
-use baize_core::storage::Storage;
+use baize_core::identity::IdentityProvider;
+use baize_core::approval::ApprovalPolicy;
+use baize_core::storage::{BlobStore, Storage};
 use baize_core::workspace::WorkspaceManager;
 use baize_core::ROOT_AGENT_ID;
 
@@ -13,28 +14,34 @@ use crate::hook::HookRegistry;
 // 共享宏（必须在子模块声明之前，子模块才能使用）
 macro_rules! labels {
     ($($k:expr => $v:expr),* $(,)?) => {{
-        let mut m = HashMap::<String, String>::new();
-        $(m.insert($k.to_string(), $v.to_string());)*
-        m
+        <HashMap<String, String>>::from([
+            $(($k.to_string(), $v.to_string())),*
+        ])
     }};
 }
 
 // 子模块
 pub mod agent_manager;
+pub mod approval;
 pub mod auth;
 pub mod auditor;
 pub mod data_ops;
 pub mod elevation;
 pub mod file_sync;
 pub mod git_ops;
+pub mod identity;
+pub mod protocol;
 
 // 重新导出 trait 和类型（方便外部使用）
 pub use auditor::Auditor;
 pub use agent_manager::{AgentRegistry, PermissionGuard};
+pub use approval::{ApprovalManager, ApprovalStore, BlobApprovalStore, AutoApprovePolicy};
 pub use data_ops::DataOps;
 pub use elevation::ElevationManager;
 pub use file_sync::{FileSync, FileRecord, FileContent, PushResult, PullResult};
 pub use git_ops::{GitOps, GitCommitInfo, RepoStats};
+pub use protocol::{BlobTypeHandler, ProtocolRegistry, ValidationContext};
+pub use identity::CertIdentityProvider;
 
 /// 判断 RFC3339 时间戳是否已过期（当前时间 > timestamp）
 /// 解析失败时视为已过期（fail-closed）
@@ -44,23 +51,53 @@ pub(crate) fn is_timestamp_expired(timestamp: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// 比较两个 RFC3339 时间戳：a > b？
+/// 解析失败时返回 None（调用方决定是否跳过比较）
+pub(crate) fn is_timestamp_after(a: &str, b: &str) -> Option<bool> {
+    let dt_a = chrono::DateTime::parse_from_rfc3339(a).ok()?;
+    let dt_b = chrono::DateTime::parse_from_rfc3339(b).ok()?;
+    Some(dt_a > dt_b)
+}
+
 /// 白泽主控 — 五关口管道核心
 pub struct Baize {
-    pub storage: Storage,
+    pub storage: Arc<dyn BlobStore>,
+    pub crypto: CryptoProvider,
+    pub(super) protocol_registry: ProtocolRegistry,
     pub workspace_mgr: WorkspaceManager,
     /// 主仓库路径：所有 agent 共享的单一数据源目录
     pub(super) main_repo: PathBuf,
     pub(super) hooks: HookRegistry,
-    /// agent_id → (CertIdentity, IssuerCtx)
-    pub(super) agents: HashMap<String, (CertIdentity, baize_core::cert::IssuerCtx)>,
+    /// 可插拔身份提供者（默认 CertIdentityProvider）
+    pub(super) identity: Arc<dyn IdentityProvider>,
+    /// 审批存储（默认 BlobApprovalStore）
+    pub(super) approval_store: Arc<dyn approval::ApprovalStore>,
+    /// 审批策略（默认 RuleBasedPolicy，空规则 = 自动通过）
+    pub(super) approval_policy: Arc<dyn ApprovalPolicy>,
     /// v1：ASL 合规上下文（适配 + 校验）
     pub asl: baize_asl::AslContext,
 }
 
 impl Baize {
+    /// 获取存储后端的 trait object 引用
+    ///
+    /// 比 `&*self.storage` 更清晰，避免在调用点关心 Arc 解引用细节。
+    pub fn store(&self) -> &dyn BlobStore {
+        &*self.storage
+    }
+
+    /// 注册自定义协议 handler（扩展新的 blob type）
+    ///
+    /// 二次开发者实现 `BlobTypeHandler` trait 后调用此方法注册。
+    /// 同名 handler 会覆盖默认 handler。
+    pub fn register_handler(&mut self, handler: Box<dyn BlobTypeHandler>) {
+        self.protocol_registry.register(handler);
+    }
+
     /// 初始化白泽：创建存储 + 生成 Root CA
     pub fn init(db_path: &str, ws_base: &str, main_repo: &str) -> Result<Self, Error> {
-        let storage = Storage::open(db_path)?;
+        let crypto = CryptoProvider::default();
+        let storage: Arc<dyn BlobStore> = Arc::new(Storage::open(db_path)?);
         let mut workspace_mgr = WorkspaceManager::new(ws_base)?;
 
         // 创建主仓库目录 + Git 初始化
@@ -69,163 +106,117 @@ impl Baize {
             .map_err(|e| Error::Internal(anyhow::anyhow!("failed to create main repo dir: {}", e)))?;
         Self::git_init(&main_repo_path)?;
 
-        // 检查是否已有 root CA
-        let mut root_filter = HashMap::new();
-        root_filter.insert("type".to_string(), "root-ca".to_string());
-        let existing_root = storage.blob_query(&root_filter)?;
+        // 初始化身份提供者（root CA 生成 + agent 恢复）
+        let cert_provider = identity::CertIdentityProvider::new();
+        cert_provider.init_root(&*storage, &crypto)?;
+        cert_provider.restore(&*storage, &crypto)?;
 
-        let mut agents = HashMap::new();
-        let master_secret = baize_core::crypto::master_secret_from_env();
-
-        if !existing_root.is_empty() {
-            // 已有 root CA：从存储恢复
-            let root_cert_pem = &existing_root[0].content;
-            let root_identity = CertTool::parse_identity(root_cert_pem)?;
-
-            // 尝试恢复 root key
-            let mut key_filter = HashMap::new();
-            key_filter.insert("type".to_string(), "agent-key".to_string());
-            key_filter.insert("agent-id".to_string(), ROOT_AGENT_ID.to_string());
-            let root_keys = storage.blob_query(&key_filter)?;
-
-            if let Some(key_blob) = root_keys.first() {
-                let root_key_pem = Self::decrypt_key_content(&key_blob.content, &master_secret)?;
-                let root_ctx = CertTool::recover_issuer(root_cert_pem, &root_key_pem)?;
-                agents.insert(ROOT_AGENT_ID.to_string(), (root_identity, root_ctx));
-            } else {
-                let (root_bundle, root_ctx) = CertTool::generate_root_ca()?;
-                let labels = labels! { "type" => "root-ca", "agent-id" => ROOT_AGENT_ID };
-                storage.blob_write(&root_bundle.cert_pem, &labels)?;
-                let key_labels = labels! { "type" => "agent-key", "agent-id" => ROOT_AGENT_ID };
-                storage.blob_write(&root_bundle.key_pem, &key_labels)?;
-                agents.insert(ROOT_AGENT_ID.to_string(), (root_bundle.identity, root_ctx));
-            }
-        } else {
-            // 首次初始化
-            let (root_bundle, root_ctx) = CertTool::generate_root_ca()?;
-            let labels = labels! { "type" => "root-ca", "agent-id" => ROOT_AGENT_ID };
-            storage.blob_write(&root_bundle.cert_pem, &labels)?;
-            let key_labels = labels! { "type" => "agent-key", "agent-id" => ROOT_AGENT_ID };
-            storage.blob_write(&root_bundle.key_pem, &key_labels)?;
-            agents.insert(ROOT_AGENT_ID.to_string(), (root_bundle.identity, root_ctx));
-        }
-
-        // 为 root 创建/恢复 workspace
+        // 为所有已恢复的 agent 确保 workspace
         workspace_mgr.ensure(ROOT_AGENT_ID)?;
-
-        // 恢复所有已注册的 agent
-        let mut agent_filter = HashMap::new();
-        agent_filter.insert("type".to_string(), "agent-cert".to_string());
-        let agent_certs = storage.blob_query(&agent_filter)?;
-
-        for cert_blob in &agent_certs {
-            let agent_id = cert_blob.labels.get("agent-id")
-                .cloned()
-                .unwrap_or_default();
-            if agent_id.is_empty() || agent_id == ROOT_AGENT_ID {
-                continue;
+        cert_provider.for_each_agent(|agent_id, _| {
+            if agent_id != ROOT_AGENT_ID {
+                let _ = workspace_mgr.ensure(agent_id);
             }
+        });
 
-            let revoked = storage.label_query("revoked", Some("true"))
-                .unwrap_or_default()
-                .iter()
-                .any(|l| l.entity_hash == cert_blob.hash);
-            if revoked {
-                continue;
-            }
-
-            let identity = CertTool::parse_identity(&cert_blob.content)?;
-
-            // v1 恢复：从 agent-cert labels 重建 CredentialStatus
-            let status = Self::recover_credential_status(&storage, &cert_blob.hash);
-            let identity = CertIdentity { status, ..identity };
-
-            let mut akey_filter = HashMap::new();
-            akey_filter.insert("type".to_string(), "agent-key".to_string());
-            akey_filter.insert("agent-id".to_string(), agent_id.clone());
-            let agent_keys = storage.blob_query(&akey_filter)?;
-
-            // 优先使用 IDN_SIGN 用途的 key 恢复 issuer context
-            let idn_sign_key = agent_keys.iter().find(|b| {
-                b.labels.get("x-key-purpose").map(|v| v.as_str()) == Some("IDN_SIGN")
-            }).or_else(|| agent_keys.first());
-
-            if let Some(key_blob) = idn_sign_key {
-                let agent_key_pem = Self::decrypt_key_content(&key_blob.content, &master_secret);
-                match agent_key_pem {
-                    Ok(key_pem) => {
-                        if let Ok(agent_ctx) = CertTool::recover_issuer(&cert_blob.content, &key_pem) {
-                            if let Err(e) = workspace_mgr.ensure(&agent_id) {
-                                eprintln!("WARNING: skip agent {}: workspace ensure failed: {}", agent_id, e);
-                                continue;
-                            }
-                            agents.insert(agent_id, (identity, agent_ctx));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("WARNING: skip agent {}: key decryption failed: {}", agent_id, e);
-                        continue;
-                    }
-                }
-            } else if let Some(key_blob) = agent_keys.first() {
-                // v0 兼容：没有 x-key-purpose label 的旧 key blob
-                let agent_key_pem = Self::decrypt_key_content(&key_blob.content, &master_secret);
-                match agent_key_pem {
-                    Ok(key_pem) => {
-                        if let Ok(agent_ctx) = CertTool::recover_issuer(&cert_blob.content, &key_pem) {
-                            if let Err(e) = workspace_mgr.ensure(&agent_id) {
-                                eprintln!("WARNING: skip agent {}: workspace ensure failed: {}", agent_id, e);
-                                continue;
-                            }
-                            agents.insert(agent_id, (identity, agent_ctx));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("WARNING: skip agent {}: key decryption failed: {}", agent_id, e);
-                        continue;
-                    }
-                }
-            }
-        }
+        let identity: Arc<dyn IdentityProvider> = Arc::new(cert_provider);
+        let approval_store: Arc<dyn approval::ApprovalStore> = Arc::new(
+            approval::BlobApprovalStore::new(storage.clone())
+        );
+        let approval_policy: Arc<dyn ApprovalPolicy> = Arc::new(approval::RuleBasedPolicy::new(vec![]));
 
         Ok(Self {
             storage,
+            crypto,
+            protocol_registry: ProtocolRegistry::default(),
             workspace_mgr,
             main_repo: main_repo_path,
             hooks: crate::hook::default_hooks(),
-            agents,
+            identity,
+            approval_store,
+            approval_policy,
             asl: baize_asl::AslContext::default(),
         })
     }
 
-    /// 解密 key blob content（如有 master secret）
-    fn decrypt_key_content(content: &str, master_secret: &Option<Vec<u8>>) -> Result<String, Error> {
-        match master_secret {
-            Some(secret) => baize_core::crypto::decrypt_key(content, secret),
-            None => Ok(content.to_string()),
-        }
-    }
-
-    /// 从 agent-cert blob 的 labels 恢复凭证状态
-    /// 优先级：revoked > expired > suspended > active
-    fn recover_credential_status(storage: &Storage, cert_hash: &str) -> CredentialStatus {
-        let labels = storage.label_query_for_entity(cert_hash)
-            .unwrap_or_default();
-
-        if labels.iter().any(|l| l.key == LABEL_CERT_REVOKED && l.value == "true") {
-            CredentialStatus::Revoked
-        } else if labels.iter().any(|l| l.key == LABEL_CERT_EXPIRED && l.value == "true") {
-            CredentialStatus::Expired
-        } else if labels.iter().any(|l| l.key == LABEL_CERT_SUSPENDED && l.value == "true") {
-            CredentialStatus::Suspended
-        } else {
-            CredentialStatus::Active
-        }
-    }
-
     /// 用内存数据库初始化（用于测试）
     pub fn init_in_memory() -> Result<Self, Error> {
-        let storage = Storage::open(":memory:")?;
+        BaizeBuilder::new().build_in_memory()
+    }
+
+    /// 创建 Builder 用于自定义组件
+    pub fn builder() -> BaizeBuilder {
+        BaizeBuilder::new()
+    }
+}
+
+/// Baize 构建器 — 允许外部 crate 替换可插拔组件
+///
+/// # 示例
+///
+/// ```ignore
+/// let baize = Baize::builder()
+///     .storage(my_custom_storage)
+///     .crypto(my_crypto_provider)
+///     .approval_policy(my_policy)
+///     .build_in_memory()?;
+/// ```
+pub struct BaizeBuilder {
+    storage: Option<Arc<dyn BlobStore>>,
+    crypto: Option<CryptoProvider>,
+    identity: Option<Arc<dyn IdentityProvider>>,
+    approval_policy: Option<Arc<dyn ApprovalPolicy>>,
+    approval_store: Option<Arc<dyn approval::ApprovalStore>>,
+}
+
+impl BaizeBuilder {
+    pub fn new() -> Self {
+        Self {
+            storage: None,
+            crypto: None,
+            identity: None,
+            approval_policy: None,
+            approval_store: None,
+        }
+    }
+
+    /// 自定义存储后端
+    pub fn storage(mut self, s: Arc<dyn BlobStore>) -> Self {
+        self.storage = Some(s);
+        self
+    }
+
+    /// 自定义加密提供者
+    pub fn crypto(mut self, c: CryptoProvider) -> Self {
+        self.crypto = Some(c);
+        self
+    }
+
+    /// 自定义身份提供者
+    pub fn identity(mut self, id: Arc<dyn IdentityProvider>) -> Self {
+        self.identity = Some(id);
+        self
+    }
+
+    /// 自定义审批策略
+    pub fn approval_policy(mut self, p: Arc<dyn ApprovalPolicy>) -> Self {
+        self.approval_policy = Some(p);
+        self
+    }
+
+    /// 自定义审批存储
+    pub fn approval_store(mut self, s: Arc<dyn approval::ApprovalStore>) -> Self {
+        self.approval_store = Some(s);
+        self
+    }
+
+    /// 使用内存存储构建（用于测试）
+    pub fn build_in_memory(self) -> Result<Baize, Error> {
+        let crypto = self.crypto.unwrap_or_default();
+        let storage = self.storage.unwrap_or_else(|| {
+            Arc::new(Storage::open(":memory:").expect("in-memory storage should not fail"))
+        });
+
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_dir = std::env::temp_dir().join(format!("baize-test-{}-{}", std::process::id(), unique));
@@ -236,43 +227,55 @@ impl Baize {
             .map_err(|e| Error::Internal(anyhow::anyhow!("failed to create test main repo: {}", e)))?;
         Self::git_init(&main_repo)?;
 
-        let (root_bundle, root_ctx) = CertTool::generate_root_ca()?;
-
-        let labels = labels! { "type" => "root-ca", "agent-id" => ROOT_AGENT_ID };
-        storage.blob_write(&root_bundle.cert_pem, &labels)?;
-        // root agent 密钥：兼容 init 路径（含 purpose labels 供签名 middleware 查询）
-        let key_labels = labels! {
-            "type" => "agent-key",
-            "agent-id" => ROOT_AGENT_ID,
-            LABEL_KEY_OWNER => ROOT_AGENT_ID,
-            LABEL_KEY_PURPOSE => "IDN_SIGN",
-            LABEL_KEY_ALGORITHM => "Ed25519",
-            LABEL_KEY_NONEXPORTABLE => "true",
-            LABEL_KEY_SEE_LEVEL => "L1",
+        let identity = match self.identity {
+            Some(id) => {
+                workspace_mgr.ensure(ROOT_AGENT_ID)?;
+                id
+            }
+            None => {
+                let cert_provider = identity::CertIdentityProvider::new();
+                cert_provider.init_root(&*storage, &crypto)?;
+                workspace_mgr.ensure(ROOT_AGENT_ID)?;
+                Arc::new(cert_provider)
+            }
         };
-        storage.blob_write(&root_bundle.key_pem, &key_labels)?;
 
-        let root_identity = root_bundle.identity;
-        let mut agents = HashMap::new();
-        agents.insert(ROOT_AGENT_ID.to_string(), (root_identity, root_ctx));
+        let approval_store = self.approval_store.unwrap_or_else(|| {
+            Arc::new(approval::BlobApprovalStore::new(storage.clone()))
+        });
+        let approval_policy = self.approval_policy
+            .unwrap_or_else(|| Arc::new(approval::RuleBasedPolicy::new(vec![])));
 
-        // 为 root 创建 workspace
-        workspace_mgr.ensure(ROOT_AGENT_ID)?;
-
-        Ok(Self {
+        Ok(Baize {
             storage,
+            crypto,
+            protocol_registry: ProtocolRegistry::default(),
             workspace_mgr,
             main_repo,
             hooks: crate::hook::default_hooks(),
-            agents,
+            identity,
+            approval_store,
+            approval_policy,
             asl: baize_asl::AslContext::default(),
         })
+    }
+
+    fn git_init(path: &Path) -> Result<(), Error> {
+        Baize::git_init(path)?;
+        Ok(())
+    }
+}
+
+impl Default for BaizeBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use baize_core::scope::{ElevationMode, ElevationStatus, Level};
 
     // 需要引入 trait 才能调用 trait 方法
@@ -293,7 +296,7 @@ mod tests {
     #[test]
     fn register_agent() {
         let mut baize = Baize::init_in_memory().unwrap();
-        let (id, bundle) = baize.agent_register(
+        let (id, bundle) = baize.agent_register("baize-root", 
             "agent-001",
             Level(2),
             vec!["A", "B"],
@@ -308,9 +311,9 @@ mod tests {
     #[test]
     fn register_child_agent() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("parent", Level(3), vec!["A", "B", "C"], None).unwrap();
+        baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B", "C"], None).unwrap();
 
-        let (id, bundle) = baize.agent_register(
+        let (id, bundle) = baize.agent_register("baize-root", 
             "child",
             Level(2),
             vec!["A"],
@@ -324,22 +327,22 @@ mod tests {
     #[test]
     fn revoke_agent() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("agent-001", Level(2), vec!["A"], None).unwrap();
-        baize.agent_revoke("agent-001").unwrap();
+        baize.agent_register("baize-root", "agent-001", Level(2), vec!["A"], None).unwrap();
+        baize.agent_revoke("baize-root", "agent-001").unwrap();
         assert_eq!(baize.agent_list().len(), 1);
     }
 
     #[test]
     fn revoke_root_fails() {
         let mut baize = Baize::init_in_memory().unwrap();
-        let result = baize.agent_revoke("baize-root");
+        let result = baize.agent_revoke("baize-root", "baize-root");
         assert!(result.is_err());
     }
 
     #[test]
     fn elevation_flow() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("agent-001", Level(3), vec!["A", "B", "C"], None).unwrap();
+        baize.agent_register("baize-root", "agent-001", Level(3), vec!["A", "B", "C"], None).unwrap();
 
         let req_id = baize.elevation_request(
             "agent-001",
@@ -361,7 +364,7 @@ mod tests {
     #[test]
     fn elevation_can_request_beyond_scope() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("agent-001", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "agent-001", Level(2), vec!["A"], None).unwrap();
 
         let result = baize.elevation_request(
             "agent-001",
@@ -376,8 +379,8 @@ mod tests {
     #[test]
     fn trace_identity_chain() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("parent", Level(3), vec!["A", "B"], None).unwrap();
-        baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
+        baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B"], None).unwrap();
+        baize.agent_register("baize-root", "child", Level(2), vec!["A"], Some("parent")).unwrap();
 
         let chain = baize.trace_identity("child").unwrap();
         assert_eq!(chain.len(), 3);
@@ -389,24 +392,24 @@ mod tests {
     #[test]
     fn scope_exceed_fails() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("parent", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "parent", Level(2), vec!["A"], None).unwrap();
 
-        let result = baize.agent_register("child", Level(3), vec!["A"], Some("parent"));
+        let result = baize.agent_register("baize-root", "child", Level(3), vec!["A"], Some("parent"));
         assert!(result.is_err());
     }
 
     #[test]
     fn agent_register_duplicate_fails() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("dup", Level(2), vec!["A"], None).unwrap();
-        let result = baize.agent_register("dup", Level(2), vec!["A"], None);
+        baize.agent_register("baize-root", "dup", Level(2), vec!["A"], None).unwrap();
+        let result = baize.agent_register("baize-root", "dup", Level(2), vec!["A"], None);
         assert!(result.is_err());
     }
 
     #[test]
     fn agent_revoke_nonexistent() {
         let mut baize = Baize::init_in_memory().unwrap();
-        let result = baize.agent_revoke("no-such-agent");
+        let result = baize.agent_revoke("baize-root", "no-such-agent");
         assert!(result.is_err());
     }
 
@@ -466,7 +469,7 @@ mod tests {
     #[test]
     fn elevation_approve_already_processed() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("agent-001", Level(3), vec!["A", "B", "C"], None).unwrap();
+        baize.agent_register("baize-root", "agent-001", Level(3), vec!["A", "B", "C"], None).unwrap();
 
         let req_id = baize.elevation_request(
             "agent-001", vec!["A"], ElevationMode::ReadOnly, "test", None
@@ -489,7 +492,7 @@ mod tests {
     #[test]
     fn elevation_with_duration() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("agent-001", Level(3), vec!["A", "B"], None).unwrap();
+        baize.agent_register("baize-root", "agent-001", Level(3), vec!["A", "B"], None).unwrap();
 
         let req_id = baize.elevation_request(
             "agent-001", vec!["A"], ElevationMode::ReadOnly, "test", Some("30m"),
@@ -505,7 +508,7 @@ mod tests {
     #[test]
     fn elevation_expiry_lazy() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("agent-001", Level(3), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "agent-001", Level(3), vec!["A"], None).unwrap();
 
         let req_id = baize.elevation_request(
             "agent-001", vec!["A"], ElevationMode::ReadOnly, "test", Some("1h"),
@@ -519,7 +522,7 @@ mod tests {
         let _blob = baize.storage.blob_read(&req_id).unwrap();
 
         let mut baize2 = Baize::init_in_memory().unwrap();
-        baize2.agent_register("w", Level(3), vec!["A"], None).unwrap();
+        baize2.agent_register("baize-root", "w", Level(3), vec!["A"], None).unwrap();
 
         let content = serde_json::json!({"agent": "w", "zones": ["A"], "mode": "ReadOnly", "reason": "test", "time": "2020-01-01"}).to_string();
         let mut lbls = HashMap::new();
@@ -542,8 +545,8 @@ mod tests {
     #[test]
     fn approval_routing_parent_can_approve() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("parent", Level(3), vec!["A", "B", "C"], None).unwrap();
-        baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
+        baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B", "C"], None).unwrap();
+        baize.agent_register("baize-root", "child", Level(2), vec!["A"], Some("parent")).unwrap();
 
         let req_id = baize.elevation_request(
             "child", vec!["A"], ElevationMode::ReadOnly, "need A", None,
@@ -555,8 +558,8 @@ mod tests {
     #[test]
     fn approval_routing_parent_cannot_approve_beyond_scope() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("parent", Level(3), vec!["A", "B"], None).unwrap();
-        baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
+        baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B"], None).unwrap();
+        baize.agent_register("baize-root", "child", Level(2), vec!["A"], Some("parent")).unwrap();
 
         let req_id = baize.elevation_request(
             "child", vec!["Z"], ElevationMode::ReadOnly, "need Z", None,
@@ -569,8 +572,8 @@ mod tests {
     #[test]
     fn approval_routing_root_can_approve_anything() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("parent", Level(3), vec!["A", "B"], None).unwrap();
-        baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
+        baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B"], None).unwrap();
+        baize.agent_register("baize-root", "child", Level(2), vec!["A"], Some("parent")).unwrap();
 
         let req_id = baize.elevation_request(
             "child", vec!["Z"], ElevationMode::ReadOnly, "need Z", None,
@@ -582,8 +585,8 @@ mod tests {
     #[test]
     fn approval_routing_non_parent_cannot_approve() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("agent-a", Level(3), vec!["A"], None).unwrap();
-        baize.agent_register("agent-b", Level(3), vec!["B"], None).unwrap();
+        baize.agent_register("baize-root", "agent-a", Level(3), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "agent-b", Level(3), vec!["B"], None).unwrap();
 
         let req_id = baize.elevation_request(
             "agent-a", vec!["A"], ElevationMode::ReadOnly, "test", None,
@@ -596,7 +599,7 @@ mod tests {
     #[test]
     fn elevation_return_success() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
         let req_id = baize.elevation_request(
             "worker", vec!["A"], ElevationMode::ReadOnly, "need A", None,
@@ -613,7 +616,7 @@ mod tests {
     #[test]
     fn elevation_return_not_approved_fails() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
         let req_id = baize.elevation_request(
             "worker", vec!["A"], ElevationMode::ReadOnly, "need A", None,
@@ -626,7 +629,7 @@ mod tests {
     #[test]
     fn elevation_return_already_returned_fails() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
         let req_id = baize.elevation_request(
             "worker", vec!["A"], ElevationMode::ReadOnly, "need A", None,
@@ -641,8 +644,8 @@ mod tests {
     #[test]
     fn elevation_return_wrong_caller_fails() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
-        baize.agent_register("other", Level(2), vec!["B"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "other", Level(2), vec!["B"], None).unwrap();
 
         let req_id = baize.elevation_request(
             "worker", vec!["A"], ElevationMode::ReadOnly, "need A", None,
@@ -656,7 +659,7 @@ mod tests {
     #[test]
     fn export_plain_blob_allowed() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("reader", Level(0), vec![], None).unwrap();
+        baize.agent_register("baize-root", "reader", Level(0), vec![], None).unwrap();
 
         let blob = baize.pipe_blob_write("baize-root", "plain data", &HashMap::new()).unwrap();
 
@@ -667,7 +670,7 @@ mod tests {
     #[test]
     fn export_sensitive_blob_requires_level() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("low-agent", Level(1), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "low-agent", Level(1), vec!["A"], None).unwrap();
 
         let mut labels = HashMap::new();
         labels.insert("sensitivity".to_string(), "high".to_string());
@@ -680,7 +683,7 @@ mod tests {
     #[test]
     fn export_zone_blob_requires_scope() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("agent-a", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "agent-a", Level(2), vec!["A"], None).unwrap();
 
         let mut labels = HashMap::new();
         labels.insert("zone".to_string(), "B".to_string());
@@ -718,7 +721,7 @@ mod tests {
     #[test]
     fn elevation_expired_auto_cleanup() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
         let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let mut labels = HashMap::new();
@@ -745,7 +748,7 @@ mod tests {
     #[test]
     fn file_write_and_read() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("writer", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "writer", Level(2), vec!["A"], None).unwrap();
 
         let record = baize.pipe_file_write("writer", "A/config.yaml", b"key: value", None).unwrap();
         assert_eq!(record.path, "A/config.yaml");
@@ -759,7 +762,7 @@ mod tests {
     #[test]
     fn file_write_creates_blob() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("writer", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "writer", Level(2), vec!["A"], None).unwrap();
 
         baize.pipe_file_write("writer", "A/data.txt", b"hello", None).unwrap();
 
@@ -775,7 +778,7 @@ mod tests {
     #[test]
     fn file_delete() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("writer", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "writer", Level(2), vec!["A"], None).unwrap();
 
         baize.pipe_file_write("writer", "A/temp.txt", b"temp", None).unwrap();
         baize.pipe_file_delete("writer", "A/temp.txt").unwrap();
@@ -787,7 +790,7 @@ mod tests {
     #[test]
     fn file_delete_records_audit() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("writer", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "writer", Level(2), vec!["A"], None).unwrap();
 
         baize.pipe_file_write("writer", "A/del.txt", b"delme", None).unwrap();
         baize.pipe_file_delete("writer", "A/del.txt").unwrap();
@@ -802,7 +805,7 @@ mod tests {
     #[test]
     fn file_zone_check_blocks() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("writer", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "writer", Level(2), vec!["A"], None).unwrap();
 
         let result = baize.pipe_file_write("writer", "B/data.txt", b"hack", None);
         assert!(result.is_err());
@@ -811,7 +814,7 @@ mod tests {
     #[test]
     fn file_zone_root_accessible() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("writer", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "writer", Level(2), vec!["A"], None).unwrap();
 
         let record = baize.pipe_file_write("writer", "readme.txt", b"hello", None).unwrap();
         assert_eq!(record.path, "readme.txt");
@@ -820,7 +823,7 @@ mod tests {
     #[test]
     fn file_list() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("writer", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "writer", Level(2), vec!["A"], None).unwrap();
 
         baize.pipe_file_write("writer", "A/a.txt", b"a", None).unwrap();
         baize.pipe_file_write("writer", "A/b.txt", b"b", None).unwrap();
@@ -832,7 +835,7 @@ mod tests {
     #[test]
     fn file_level0_cannot_write() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("sandbox", Level(0), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "sandbox", Level(0), vec!["A"], None).unwrap();
 
         let result = baize.pipe_file_write("sandbox", "A/data.txt", b"try", None);
         assert!(result.is_err());
@@ -841,7 +844,7 @@ mod tests {
     #[test]
     fn push_writes_to_main_repo() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
         baize.pipe_file_write("worker", "A/config.yaml", b"key: value", None).unwrap();
         baize.pipe_file_write("worker", "A/data.txt", b"hello", None).unwrap();
@@ -858,7 +861,7 @@ mod tests {
     #[test]
     fn push_empty_workspace_fails() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
         let result = baize.pipe_push("worker", "empty", None);
         assert!(result.is_err());
@@ -867,7 +870,7 @@ mod tests {
     #[test]
     fn pull_restores_files_from_main_repo() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
         baize.pipe_file_write("worker", "A/config.yaml", b"key: value", None).unwrap();
         baize.pipe_push("worker", "v1", None).unwrap();
@@ -885,7 +888,7 @@ mod tests {
     #[test]
     fn push_creates_auth_blob() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
         baize.pipe_file_write("worker", "A/v1.txt", b"version 1", None).unwrap();
         baize.pipe_push("worker", "v1", None).unwrap();
@@ -900,8 +903,8 @@ mod tests {
     #[test]
     fn push_pull_cross_agent() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("alice", Level(2), vec!["A"], None).unwrap();
-        baize.agent_register("bob", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "alice", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "bob", Level(2), vec!["A"], None).unwrap();
 
         baize.pipe_file_write("alice", "A/shared.txt", b"from alice", None).unwrap();
         baize.pipe_push("alice", "alice's work", None).unwrap();
@@ -916,7 +919,7 @@ mod tests {
     #[test]
     fn pull_empty_main_repo() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
         let result = baize.pipe_pull("worker", None).unwrap();
         assert_eq!(result.files, 0);
@@ -925,7 +928,7 @@ mod tests {
     #[test]
     fn pull_syncs_from_main_repo() {
         let mut baize = Baize::init_in_memory().unwrap();
-        baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+        baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
         baize.pipe_file_write("worker", "A/real.txt", b"real content", None).unwrap();
         baize.pipe_push("worker", "commit 1", None).unwrap();

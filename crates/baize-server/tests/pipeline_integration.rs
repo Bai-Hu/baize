@@ -10,8 +10,8 @@ use baize_server::pipeline::{AgentRegistry, ElevationManager};
 fn test_full_delegation_chain() {
     let mut baize = Baize::init_in_memory().unwrap();
 
-    let (_, parent_bundle) = baize.agent_register("parent", Level(3), vec!["A", "B", "C"], None).unwrap();
-    let (_, child_bundle) = baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
+    let (_, parent_bundle) = baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B", "C"], None).unwrap();
+    let (_, child_bundle) = baize.agent_register("baize-root", "child", Level(2), vec!["A"], Some("parent")).unwrap();
 
     // 身份追溯
     let chain = baize.trace_identity("child").unwrap();
@@ -42,9 +42,9 @@ fn test_full_delegation_chain() {
 #[test]
 fn test_scope_level_exceeds_parent() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("parent", Level(2), vec!["A"], None).unwrap();
+    baize.agent_register("baize-root", "parent", Level(2), vec!["A"], None).unwrap();
 
-    let result = baize.agent_register("child", Level(3), vec!["A"], Some("parent"));
+    let result = baize.agent_register("baize-root", "child", Level(3), vec!["A"], Some("parent"));
     assert!(result.is_err());
 }
 
@@ -52,10 +52,10 @@ fn test_scope_level_exceeds_parent() {
 #[test]
 fn test_scope_zones_not_subset() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("parent", Level(3), vec!["A", "B"], None).unwrap();
+    baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B"], None).unwrap();
 
     // "C" 不在 parent 的 zones 中
-    let result = baize.agent_register("child", Level(2), vec!["A", "C"], Some("parent"));
+    let result = baize.agent_register("baize-root", "child", Level(2), vec!["A", "C"], Some("parent"));
     assert!(result.is_err());
 }
 
@@ -63,7 +63,7 @@ fn test_scope_zones_not_subset() {
 #[test]
 fn test_elevation_beyond_scope() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("worker", Level(2), vec!["A", "B"], None).unwrap();
+    baize.agent_register("baize-root", "worker", Level(2), vec!["A", "B"], None).unwrap();
 
     // scope 内的 zone → 成功
     let result = baize.elevation_request("worker", vec!["A"], ElevationMode::ReadOnly, "need A", None);
@@ -82,10 +82,10 @@ fn test_elevation_beyond_scope() {
 #[test]
 fn test_revoke_cascading() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("parent", Level(3), vec!["A", "B", "C"], None).unwrap();
-    baize.agent_register("child", Level(2), vec!["A"], Some("parent")).unwrap();
+    baize.agent_register("baize-root", "parent", Level(3), vec!["A", "B", "C"], None).unwrap();
+    baize.agent_register("baize-root", "child", Level(2), vec!["A"], Some("parent")).unwrap();
 
-    baize.agent_revoke("parent").unwrap();
+    baize.agent_revoke("baize-root", "parent").unwrap();
 
     // 列表中只剩 root + child
     let agents = baize.agent_list();
@@ -103,7 +103,7 @@ fn test_revoke_cascading() {
 #[test]
 fn test_audit_trail() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("worker", Level(2), vec!["A"], None).unwrap();
+    baize.agent_register("baize-root", "worker", Level(2), vec!["A"], None).unwrap();
 
     baize.storage.blob_write("task data", &HashMap::new()).unwrap();
 
@@ -135,7 +135,7 @@ fn test_agent_persistence() {
     // 实例 1：注册 agent
     {
         let mut baize = Baize::init(&db_str, &ws_str, &main_str).unwrap();
-        baize.agent_register("persistent", Level(3), vec!["X", "Y"], None).unwrap();
+        baize.agent_register("baize-root", "persistent", Level(3), vec!["X", "Y"], None).unwrap();
     }
 
     // 实例 2：验证 agent 恢复
@@ -169,8 +169,8 @@ fn test_revoke_persistence() {
     // 实例 1：注册 + 撤销
     {
         let mut baize = Baize::init(&db_str, &ws_str, &main_str).unwrap();
-        baize.agent_register("temp", Level(2), vec!["Z"], None).unwrap();
-        baize.agent_revoke("temp").unwrap();
+        baize.agent_register("baize-root", "temp", Level(2), vec!["Z"], None).unwrap();
+        baize.agent_revoke("baize-root", "temp").unwrap();
     }
 
     // 实例 2：验证 temp 不恢复

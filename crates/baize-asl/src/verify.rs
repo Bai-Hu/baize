@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use baize_core::constraint::{verify_authz_constraint_reduction, verify_intent_constraint_reduction};
 use baize_core::error::Error;
 use baize_core::labels::*;
-use baize_core::storage::Storage;
+use baize_core::storage::BlobStore;
 
 use crate::adapter::AslAdapter;
 use crate::payload::*;
@@ -73,7 +73,7 @@ pub struct AuthzVerifyResult {
 /// 3. receipt.authorization_digest 与授权一致
 /// 4. 委托链完整性
 pub fn cnv_verify(
-    storage: &Storage,
+    storage: &dyn BlobStore,
     receipt_digest: &str,
 ) -> Result<CnvResult, Error> {
     let mut errors = Vec::new();
@@ -122,7 +122,7 @@ pub fn cnv_verify(
 
 /// CNV 中校验 authorization 的 source_intent/issuer/action_type
 fn validate_authz_in_cnv(
-    storage: &Storage,
+    storage: &dyn BlobStore,
     receipt: &ReceiptContent,
     intent_chain: &[ChainNode],
     errors: &mut Vec<String>,
@@ -218,7 +218,7 @@ fn is_action_in_grant(action_type: &str, grant_type: &str) -> bool {
 
 /// 沿 x-parent-intent 向上追溯意图链
 fn trace_intent_chain(
-    storage: &Storage,
+    storage: &dyn BlobStore,
     start_digest: &str,
 ) -> Result<IntentChainResult, Error> {
     let mut nodes = Vec::new();
@@ -329,7 +329,7 @@ fn extract_constraints(content: &str) -> Option<serde_json::Value> {
 }
 
 /// 检查签发方凭证状态
-fn check_issuer_status(storage: &Storage, issuer: &str, errors: &mut Vec<String>) -> bool {
+fn check_issuer_status(storage: &dyn BlobStore, issuer: &str, errors: &mut Vec<String>) -> bool {
     // 查找 issuer 的 agent-cert blob
     let mut filter = HashMap::new();
     filter.insert("type".to_string(), BLOB_TYPE_AGENT_CERT.to_string());
@@ -380,7 +380,7 @@ fn check_issuer_status(storage: &Storage, issuer: &str, errors: &mut Vec<String>
 /// 4. 委托链完整性：parent_authz_digest 逐级向上，depth 递减
 /// 5. 执行适用性：action_type 在 grant_type 范围内
 pub fn verify_authorization(
-    storage: &Storage,
+    storage: &dyn BlobStore,
     authz_digest: &str,
     action_type: &str,
     exec_ctx: &ExecutionContext,
@@ -579,7 +579,7 @@ pub fn verify_authorization(
 
 /// 委托链完整性校验
 fn verify_delegation_chain(
-    storage: &Storage,
+    storage: &dyn BlobStore,
     authz: &AuthorizationContent,
     errors: &mut Vec<String>,
 ) -> bool {
@@ -747,13 +747,14 @@ fn is_value_in_scope(target: &serde_json::Value, scope: &serde_json::Value) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baize_core::storage::Storage;
 
     fn setup_storage() -> Storage {
         Storage::open(":memory:").unwrap()
     }
 
     fn write_intent_blob(
-        storage: &Storage,
+        storage: &dyn BlobStore,
         intent_id: &str,
         constraints: &serde_json::Value,
         expires: &str,
@@ -781,7 +782,7 @@ mod tests {
     }
 
     fn write_authz_blob(
-        storage: &Storage,
+        storage: &dyn BlobStore,
         authz_id: &str,
         issuer: &str,
         subject: &str,
@@ -821,7 +822,7 @@ mod tests {
     }
 
     fn write_receipt_blob(
-        storage: &Storage,
+        storage: &dyn BlobStore,
         receipt_id: &str,
         executor: &str,
         intent_digest: &str,
@@ -851,7 +852,7 @@ mod tests {
         blob.hash
     }
 
-    fn write_agent_cert(storage: &Storage, agent_id: &str) -> String {
+    fn write_agent_cert(storage: &dyn BlobStore, agent_id: &str) -> String {
         let content = format!("{{\"agent_id\": \"{}\"}}", agent_id);
         let mut labels = HashMap::new();
         labels.insert("type".to_string(), "agent-cert".to_string());

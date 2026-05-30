@@ -319,7 +319,9 @@ impl WorkspaceManager {
             if file_type.is_dir() {
                 self.collect_files(&path, base, files)?;
             } else if let Ok(rel) = path.strip_prefix(base) {
-                files.push(rel.to_string_lossy().to_string());
+                // 统一使用 '/' 作为分隔符，保证 clean() 中 split_once('/') 在所有平台工作
+                let rel_str = rel.to_string_lossy();
+                files.push(rel_str.replace('\\', "/"));
             }
         }
 

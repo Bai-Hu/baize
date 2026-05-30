@@ -2,6 +2,8 @@ use axum::body::Body;
 use baize_server::api;
 use baize_server::Baize;
 use baize_server::pipeline::AgentRegistry;
+use baize_server::pipeline::DataOps;
+use baize_core::crypto::CryptoProvider;
 use baize_core::labels::*;
 use baize_core::scope::Level;
 use http_body_util::BodyExt;
@@ -85,6 +87,7 @@ fn post_json_signed(
     let timestamp = chrono::Utc::now().to_rfc3339();
     let method = "POST";
     let sig = baize_server::pipeline::auth::compute_signature(
+        CryptoProvider::default().request_signer.as_ref(),
         signing_key, &timestamp, method, uri, &body_str,
     );
     Request::builder()
@@ -1581,6 +1584,7 @@ async fn test_v1_signature_expired_timestamp_rejected() {
     let past = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
     let body_str = serde_json::to_string(&json!({"content": "expired"})).unwrap();
     let sig = baize_server::pipeline::auth::compute_signature(
+        CryptoProvider::default().request_signer.as_ref(),
         &signing_key, &past, "POST", "/api/v1/blobs", &body_str,
     );
     let req = Request::builder()
@@ -2364,23 +2368,17 @@ fn get_signing_key_for_agent(baize: &Baize, agent_id: &str) -> Vec<u8> {
         key_content
     };
 
-    // SHA-256 of PEM → HMAC key
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(pem.as_bytes());
-    hasher.finalize().to_vec()
+    // 使用 auth 模块的 extract_signing_key 统一提取逻辑
+    baize_server::pipeline::auth::extract_signing_key(&pem)
 }
 
-/// 辅助：计算 HMAC-SHA256 签名
-fn compute_hmac_signature(key: &[u8], timestamp: &str, method: &str, path: &str, body: &str) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
+/// 辅助：计算 Ed25519 签名
+fn compute_ed25519_signature(key: &[u8], timestamp: &str, method: &str, path: &str, body: &str) -> String {
+    use ed25519_dalek::{SigningKey, Signer};
     let input = format!("{}\n{}\n{}\n{}", timestamp, method, path, body);
-    let mut mac = HmacSha256::new_from_slice(key).unwrap();
-    mac.update(input.as_bytes());
-    let result = mac.finalize();
-    format!("hmac-sha256:{}", hex::encode(result.into_bytes()))
+    let signing_key = SigningKey::from_bytes(key.try_into().expect("key must be 32 bytes"));
+    let signature = signing_key.sign(input.as_bytes());
+    format!("ed25519:{}", hex::encode(signature.to_bytes()))
 }
 
 /// 辅助：构造带签名的 v2 POST 请求
@@ -2392,7 +2390,7 @@ fn v2_signed_post(
 ) -> Request<Body> {
     let body_str = serde_json::to_string(body).unwrap();
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let signature = compute_hmac_signature(signing_key, &timestamp, "POST", uri, &body_str);
+    let signature = compute_ed25519_signature(signing_key, &timestamp, "POST", uri, &body_str);
     Request::builder()
         .method("POST")
         .uri(uri)
@@ -2411,7 +2409,7 @@ fn v2_signed_get(
     signing_key: &[u8],
 ) -> Request<Body> {
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let signature = compute_hmac_signature(signing_key, &timestamp, "GET", uri, "");
+    let signature = compute_ed25519_signature(signing_key, &timestamp, "GET", uri, "");
     Request::builder()
         .method("GET")
         .uri(uri)
@@ -2460,7 +2458,7 @@ async fn test_v2_invalid_signature_rejected() {
         .header("content-type", "application/json")
         .header("x-agent-id", "baize-root")
         .header("x-timestamp", &timestamp)
-        .header("x-signature", "hmac-sha256:deadbeef")
+        .header("x-signature", "ed25519:deadbeef")
         .body(Body::from(body_str))
         .unwrap();
 
@@ -2471,7 +2469,7 @@ async fn test_v2_invalid_signature_rejected() {
 #[tokio::test]
 async fn test_v2_valid_signature_accepted() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("sig-tester", Level(2), vec!["A"], None).unwrap();
+    baize.agent_register("baize-root", "sig-tester", Level(2), vec!["A"], None).unwrap();
     let signing_key = get_signing_key_for_agent(&baize, "sig-tester");
     let app = api::app(baize);
 
@@ -2490,14 +2488,14 @@ async fn test_v2_valid_signature_accepted() {
 #[tokio::test]
 async fn test_v2_expired_timestamp_rejected() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("ts-tester", Level(2), vec!["A"], None).unwrap();
+    baize.agent_register("baize-root", "ts-tester", Level(2), vec!["A"], None).unwrap();
     let signing_key = get_signing_key_for_agent(&baize, "ts-tester");
     let app = api::app(baize);
 
     // 10 分钟前的时间戳 → 超出 5 分钟窗口
     let past = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
     let body_str = serde_json::to_string(&json!({"content": "expired ts", "labels": {}})).unwrap();
-    let signature = compute_hmac_signature(&signing_key, &past, "POST", "/api/v2/blobs", &body_str);
+    let signature = compute_ed25519_signature(&signing_key, &past, "POST", "/api/v2/blobs", &body_str);
 
     let req = Request::builder()
         .method("POST")
@@ -2516,7 +2514,7 @@ async fn test_v2_expired_timestamp_rejected() {
 #[tokio::test]
 async fn test_v2_proof_verify_endpoint() {
     let mut baize = Baize::init_in_memory().unwrap();
-    baize.agent_register("verify-target", Level(3), vec!["A"], None).unwrap();
+    baize.agent_register("baize-root", "verify-target", Level(3), vec!["A"], None).unwrap();
 
     // 先生成 proof
     let cert_filter = {
@@ -2562,4 +2560,190 @@ async fn test_v2_proof_verify_endpoint() {
     assert_eq!(status, StatusCode::OK, "proof verify should succeed: {:?}", body);
     assert_eq!(body["valid"], true);
     assert!(body["proof_id"].as_str().unwrap().starts_with("proof-"));
+}
+
+// ─── v2 nonce 重放防护测试 ───
+
+#[tokio::test]
+async fn test_v2_nonce_replay_rejected() {
+    let mut baize = Baize::init_in_memory().unwrap();
+    baize.agent_register("baize-root", "nonce-tester", Level(2), vec!["A"], None).unwrap();
+    let signing_key = get_signing_key_for_agent(&baize, "nonce-tester");
+    let app = api::app(baize);
+
+    let body = json!({"content": "nonce test", "labels": {}});
+    let body_str = serde_json::to_string(&body).unwrap();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let signature = compute_ed25519_signature(&signing_key, &timestamp, "POST", "/api/v2/blobs", &body_str);
+    let nonce = "unique-nonce-12345";
+
+    // 第一次请求（带 nonce）→ 成功
+    let req1 = Request::builder()
+        .method("POST")
+        .uri("/api/v2/blobs")
+        .header("content-type", "application/json")
+        .header("x-agent-id", "nonce-tester")
+        .header("x-timestamp", &timestamp)
+        .header("x-signature", &signature)
+        .header("x-nonce", nonce)
+        .body(Body::from(body_str.clone()))
+        .unwrap();
+    let (status, _) = send(&app, req1).await;
+    assert_eq!(status, StatusCode::CREATED, "first request with nonce should succeed");
+
+    // 第二次请求（相同 nonce，新签名）→ 409 Conflict
+    let timestamp2 = chrono::Utc::now().to_rfc3339();
+    let signature2 = compute_ed25519_signature(&signing_key, &timestamp2, "POST", "/api/v2/blobs", &body_str);
+    let req2 = Request::builder()
+        .method("POST")
+        .uri("/api/v2/blobs")
+        .header("content-type", "application/json")
+        .header("x-agent-id", "nonce-tester")
+        .header("x-timestamp", &timestamp2)
+        .header("x-signature", &signature2)
+        .header("x-nonce", nonce)
+        .body(Body::from(body_str))
+        .unwrap();
+    let (status, body) = send(&app, req2).await;
+    assert_eq!(status, StatusCode::CONFLICT, "replayed nonce should be rejected: {:?}", body);
+}
+
+#[tokio::test]
+async fn test_v2_no_nonce_accepted() {
+    let mut baize = Baize::init_in_memory().unwrap();
+    baize.agent_register("baize-root", "no-nonce-tester", Level(2), vec!["A"], None).unwrap();
+    let signing_key = get_signing_key_for_agent(&baize, "no-nonce-tester");
+    let app = api::app(baize);
+
+    // 不带 nonce 的 v2 请求（只有签名）→ 仍然成功
+    let req = v2_signed_post(
+        "/api/v2/blobs",
+        &json!({"content": "no nonce", "labels": {}}),
+        "no-nonce-tester",
+        &signing_key,
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "v2 request without nonce should succeed");
+}
+
+// ─── v2 session message 测试 ───
+
+fn session_init_labels(session_id: &str, peer_a: &str, peer_b: &str) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        ("type".to_string(), "session-init".to_string()),
+        (LABEL_SESSION_ID.to_string(), session_id.to_string()),
+        (LABEL_SESSION_PEER_A.to_string(), peer_a.to_string()),
+        (LABEL_SESSION_PEER_B.to_string(), peer_b.to_string()),
+        (LABEL_SESSION_STATUS.to_string(), "active".to_string()),
+    ])
+}
+
+fn session_accept_labels(session_id: &str, peer_a: &str, peer_b: &str) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        ("type".to_string(), "session-accept".to_string()),
+        (LABEL_SESSION_ID.to_string(), session_id.to_string()),
+        (LABEL_SESSION_PEER_A.to_string(), peer_a.to_string()),
+        (LABEL_SESSION_PEER_B.to_string(), peer_b.to_string()),
+        (LABEL_SESSION_STATUS.to_string(), "active".to_string()),
+    ])
+}
+
+/// 创建有效的 session-init content（含 X25519 ephemeral_pub）
+fn session_init_content(session_id: &str) -> String {
+    let (_, pub_pem) = baize_core::crypto::generate_x25519_keypair().unwrap();
+    serde_json::to_string(&json!({
+        "session_id": session_id,
+        "ephemeral_pub": pub_pem,
+        "cipher_suites": ["AES-256-GCM"]
+    })).unwrap()
+}
+
+/// 创建有效的 session-accept content（含 X25519 ephemeral_pub）
+fn session_accept_content(session_id: &str) -> String {
+    let (_, pub_pem) = baize_core::crypto::generate_x25519_keypair().unwrap();
+    serde_json::to_string(&json!({
+        "session_id": session_id,
+        "ephemeral_pub": pub_pem,
+        "selected_cipher_suite": "AES-256-GCM",
+        "handshake_transcript_digest": "sha256:test"
+    })).unwrap()
+}
+
+#[tokio::test]
+async fn test_v2_session_message_ok() {
+    let mut baize = Baize::init_in_memory().unwrap();
+    baize.agent_register("baize-root", "alice", Level(2), vec!["A"], None).unwrap();
+    baize.agent_register("baize-root", "bob", Level(2), vec!["A"], None).unwrap();
+
+    // 建立 session：init + accept
+    baize.pipe_blob_write("alice", &session_init_content("sess-1"), &session_init_labels("sess-1", "alice", "bob")).unwrap();
+    baize.pipe_blob_write("bob", &session_accept_content("sess-1"), &session_accept_labels("sess-1", "alice", "bob")).unwrap();
+
+    let signing_key = get_signing_key_for_agent(&baize, "alice");
+    let app = api::app(baize);
+
+    // v2 session message (seq=1) → 成功
+    let req = v2_signed_post(
+        "/api/v2/sessions/sess-1/message",
+        &json!({"ciphertext": "encrypted-payload", "seq": 1}),
+        "alice",
+        &signing_key,
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "v2 session message should succeed: {:?}", body);
+    assert_eq!(body["seq"], 1);
+}
+
+#[tokio::test]
+async fn test_v2_session_message_seq_skip_fails() {
+    let mut baize = Baize::init_in_memory().unwrap();
+    baize.agent_register("baize-root", "alice", Level(2), vec!["A"], None).unwrap();
+    baize.agent_register("baize-root", "bob", Level(2), vec!["A"], None).unwrap();
+
+    baize.pipe_blob_write("alice", &session_init_content("sess-2"), &session_init_labels("sess-2", "alice", "bob")).unwrap();
+    baize.pipe_blob_write("bob", &session_accept_content("sess-2"), &session_accept_labels("sess-2", "alice", "bob")).unwrap();
+
+    let signing_key = get_signing_key_for_agent(&baize, "alice");
+    let app = api::app(baize);
+
+    // seq=5 跳过了 seq=1 → 应该被拒
+    let req = v2_signed_post(
+        "/api/v2/sessions/sess-2/message",
+        &json!({"ciphertext": "data", "seq": 5}),
+        "alice",
+        &signing_key,
+    );
+    let (status, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "seq skip should be rejected");
+}
+
+#[tokio::test]
+async fn test_v2_session_message_closed_session_fails() {
+    let mut baize = Baize::init_in_memory().unwrap();
+    baize.agent_register("baize-root", "alice", Level(2), vec!["A"], None).unwrap();
+    baize.agent_register("baize-root", "bob", Level(2), vec!["A"], None).unwrap();
+
+    baize.pipe_blob_write("alice", &session_init_content("sess-3"), &session_init_labels("sess-3", "alice", "bob")).unwrap();
+    baize.pipe_blob_write("bob", &session_accept_content("sess-3"), &session_accept_labels("sess-3", "alice", "bob")).unwrap();
+
+    // 关闭 session
+    let close_labels = std::collections::HashMap::from([
+        ("type".to_string(), "session-close".to_string()),
+        (LABEL_SESSION_ID.to_string(), "sess-3".to_string()),
+        (LABEL_SESSION_STATUS.to_string(), "closed".to_string()),
+    ]);
+    baize.pipe_blob_write("alice", r#"{"action":"close"}"#, &close_labels).unwrap();
+
+    let signing_key = get_signing_key_for_agent(&baize, "alice");
+    let app = api::app(baize);
+
+    // 向已关闭的 session 发消息 → 应被拒
+    let req = v2_signed_post(
+        "/api/v2/sessions/sess-3/message",
+        &json!({"ciphertext": "data", "seq": 1}),
+        "alice",
+        &signing_key,
+    );
+    let (status, _) = send(&app, req).await;
+    assert!(status != StatusCode::CREATED, "message to closed session should be rejected");
 }

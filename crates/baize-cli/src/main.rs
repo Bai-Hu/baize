@@ -4,6 +4,7 @@ use baize_core::scope::{ElevationMode, Level};
 use baize_core::ROOT_AGENT_ID;
 use baize_server::pipeline::{
     AgentRegistry, ElevationManager, DataOps, FileSync, GitOps,
+    ApprovalManager,
 };
 use baize_server::pipeline::auditor::Auditor;
 use baize_server::Baize;
@@ -118,6 +119,9 @@ enum Commands {
         r#ref: Option<String>,
         #[arg(long, default_value = ROOT_AGENT_ID)]
         agent: String,
+        /// 自动 git commit（跳过人工审批）
+        #[arg(long)]
+        auto_commit: bool,
     },
 
     /// Pull: 主仓库同步到 workspace
@@ -156,6 +160,12 @@ enum Commands {
     Cnv {
         #[command(subcommand)]
         action: CnvAction,
+    },
+
+    /// 审批管理
+    Approval {
+        #[command(subcommand)]
+        action: ApprovalCliAction,
     },
 
     /// 启动 HTTP API 服务器
@@ -229,7 +239,10 @@ enum BlobAction {
     /// 写入 blob
     Write {
         #[arg(long)]
-        content: String,
+        content: Option<String>,
+        /// 从文件读取内容（解决多行内容中 `---` 被 clap 误解析的问题）
+        #[arg(long)]
+        content_file: Option<String>,
         #[arg(long, value_delimiter = ',')]
         labels: Option<String>,
         #[arg(long, default_value = ROOT_AGENT_ID)]
@@ -330,7 +343,10 @@ enum FileAction {
         /// 相对路径（如 config/app.yaml）
         path: String,
         #[arg(long)]
-        content: String,
+        content: Option<String>,
+        /// 从文件读取内容
+        #[arg(long)]
+        content_file: Option<String>,
         #[arg(long, value_delimiter = ',')]
         labels: Option<String>,
         #[arg(long, default_value = ROOT_AGENT_ID)]
@@ -362,14 +378,20 @@ enum IntentAction {
     /// 创建通用意图
     Create {
         #[arg(long)]
-        content: String,
+        content: Option<String>,
+        /// 从文件读取内容
+        #[arg(long)]
+        content_file: Option<String>,
         #[arg(long, default_value = ROOT_AGENT_ID)]
         agent: String,
     },
     /// 派生子意图
     Derive {
         #[arg(long)]
-        content: String,
+        content: Option<String>,
+        /// 从文件读取内容
+        #[arg(long)]
+        content_file: Option<String>,
         #[arg(long, default_value = ROOT_AGENT_ID)]
         agent: String,
     },
@@ -391,7 +413,10 @@ enum ReceiptAction {
     /// 创建执行回执
     Create {
         #[arg(long)]
-        content: String,
+        content: Option<String>,
+        /// 从文件读取内容
+        #[arg(long)]
+        content_file: Option<String>,
         #[arg(long, default_value = ROOT_AGENT_ID)]
         agent: String,
     },
@@ -413,14 +438,20 @@ enum AuthzAction {
     /// 签发授权
     Issue {
         #[arg(long)]
-        content: String,
+        content: Option<String>,
+        /// 从文件读取内容
+        #[arg(long)]
+        content_file: Option<String>,
         #[arg(long, default_value = ROOT_AGENT_ID)]
         agent: String,
     },
     /// 委托子授权
     Delegate {
         #[arg(long)]
-        content: String,
+        content: Option<String>,
+        /// 从文件读取内容
+        #[arg(long)]
+        content_file: Option<String>,
         #[arg(long, default_value = ROOT_AGENT_ID)]
         agent: String,
     },
@@ -500,6 +531,93 @@ enum CnvAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ApprovalCliAction {
+    /// 列出待我审批的请求
+    Pending {
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 查看请求详情（含传导链）
+    Show {
+        /// 请求 ID
+        id: String,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 审批通过
+    Approve {
+        /// 请求 ID
+        id: String,
+        /// 授予使用次数
+        #[arg(long, default_value = "1")]
+        count: u32,
+        /// 备注
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 驳回请求
+    Reject {
+        /// 请求 ID
+        id: String,
+        /// 原因
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 越权上传
+    Escalate {
+        /// 请求 ID
+        id: String,
+        /// 原因
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 创建预授权
+    Preauth {
+        /// 被授权者 agent ID
+        #[arg(long)]
+        grantee: String,
+        /// 操作类型（如 push, file_write）
+        #[arg(long)]
+        action: String,
+        /// 授权次数
+        #[arg(long, default_value = "1")]
+        count: u32,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 列出预授权
+    PreauthList {
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 删除预授权（仅 root 或授权者）
+    PreauthDelete {
+        /// 预授权 ID
+        id: String,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 查看审批策略
+    Policy {
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+    /// 更新审批策略（从 JSON 文件，仅 root）
+    PolicySet {
+        /// JSON 文件路径
+        file: String,
+        #[arg(long, default_value = ROOT_AGENT_ID)]
+        agent: String,
+    },
+}
+
 fn open_baize() -> anyhow::Result<Baize> {
     let db = "baize.db";
     let ws = ".baize/workspaces";
@@ -527,6 +645,23 @@ fn parse_labels(input: &str) -> HashMap<String, String> {
     map
 }
 
+/// 从 --content 或 --content-file 解析内容
+///
+/// 解决 clap 将 YAML `---` 视为 `--` 选项终止符的问题：
+/// 多行内容（YAML/JSON）应通过 --content-file 传入。
+fn resolve_content(content: Option<String>, content_file: Option<String>) -> anyhow::Result<String> {
+    match (content, content_file) {
+        (Some(c), None) => Ok(c),
+        (None, Some(f)) => {
+            let path = std::path::Path::new(&f);
+            validate_path(path)?;
+            Ok(std::fs::read_to_string(path)?)
+        }
+        (None, None) => anyhow::bail!("either --content or --content-file is required"),
+        (Some(_), Some(_)) => anyhow::bail!("cannot use both --content and --content-file"),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -547,6 +682,7 @@ fn main() -> anyhow::Result<()> {
             match action {
                 AgentAction::Register { name, level, zones, parent } => {
                     let (id, bundle) = baize.agent_register(
+                        ROOT_AGENT_ID,
                         &name,
                         Level(level),
                         zones.iter().map(|s| s.as_str()).collect(),
@@ -558,6 +694,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 AgentAction::Delegate { parent, name, level, zones } => {
                     let (id, bundle) = baize.agent_register(
+                        ROOT_AGENT_ID,
                         &name,
                         Level(level),
                         zones.iter().map(|s| s.as_str()).collect(),
@@ -568,7 +705,7 @@ fn main() -> anyhow::Result<()> {
                     println!("  Zones: {:?}", bundle.identity.zones);
                 }
                 AgentAction::Revoke { agent_id } => {
-                    baize.agent_revoke(&agent_id)?;
+                    baize.agent_revoke(ROOT_AGENT_ID, &agent_id)?;
                     println!("Agent {} 已撤销", agent_id);
                 }
                 AgentAction::List => {
@@ -605,14 +742,14 @@ fn main() -> anyhow::Result<()> {
                     let expires = (now + chrono::Duration::minutes(5)).to_rfc3339();
 
                     // credential_digest: agent credential blob 的 hash
-                    let credential_digest = {
+                    let (credential_digest, cert_labels) = {
                         let mut filter = HashMap::new();
                         filter.insert("type".to_string(), "agent-cert".to_string());
                         filter.insert("x-cert-agent".to_string(), agent_id.clone());
                         let certs = baize.storage.blob_query(&filter)?;
-                        certs.first()
-                            .map(|b| b.hash.clone())
-                            .ok_or_else(|| anyhow::anyhow!("agent certificate not found: {}", agent_id))?
+                        let cert = certs.first()
+                            .ok_or_else(|| anyhow::anyhow!("agent certificate not found: {}", agent_id))?;
+                        (cert.hash.clone(), cert.labels.clone())
                     };
 
                     // instance_state_attributes: 默认运行态属性
@@ -621,14 +758,11 @@ fn main() -> anyhow::Result<()> {
                         "instance_status": "running"
                     });
 
-                    // binding_context_digest: credential_digest + timestamp 摘要
-                    let binding_input = format!("{}:{}", credential_digest, now.to_rfc3339());
-                    let binding_digest = format!("sha256:{}", {
-                        use sha2::Digest;
-                        let mut hasher = sha2::Sha256::new();
-                        hasher.update(binding_input.as_bytes());
-                        hex::encode(hasher.finalize())
-                    });
+                    // binding_context_digest: 使用 ASL 标准计算逻辑，与 server 端验证保持一致
+                    let binding_digest = baize_asl::AslAdapter::compute_binding_context_digest(
+                        &cert_labels,
+                        &instance_attrs,
+                    );
 
                     let proof = baize_asl::payload::RuntimeProofContent {
                         proof_id: proof_id.clone(),
@@ -659,10 +793,17 @@ fn main() -> anyhow::Result<()> {
         Commands::Blob { action } => {
             let baize = open_baize()?;
             match action {
-                BlobAction::Write { content, labels, agent } => {
+                BlobAction::Write { content, content_file, labels, agent } => {
+                    let c = resolve_content(content, content_file)?;
                     let lbls = labels.map(|s| parse_labels(&s)).unwrap_or_default();
-                    let blob = baize.pipe_blob_write(&agent, &content, &lbls)?;
+                    let blob = baize.pipe_blob_write(&agent, &c, &lbls)?;
                     println!("Blob 写入成功: {}", blob.hash);
+                    // 提示：ASL 操作应使用专用命令
+                    if c.contains("\"intent_id\"") || c.contains("\"receipt_id\"")
+                        || c.contains("\"authorization_id\"") || c.contains("\"session_id\"")
+                    {
+                        eprintln!("[提示] 检测到 ASL 结构内容，建议使用 bz intent/receipt/authz/session 命令代替 bz blob write");
+                    }
                 }
                 BlobAction::Read { hash } => {
                     let blob = baize.storage.blob_read(&hash)?;
@@ -872,9 +1013,10 @@ fn main() -> anyhow::Result<()> {
         Commands::File { action } => {
             let baize = open_baize()?;
             match action {
-                FileAction::Write { path, content, labels, agent } => {
+                FileAction::Write { path, content, content_file, labels, agent } => {
+                    let c = resolve_content(content, content_file)?;
                     let lbls = labels.map(|s| parse_labels(&s)).unwrap_or_default();
-                    let record = baize.pipe_file_write(&agent, &path, content.as_bytes(), Some(lbls))?;
+                    let record = baize.pipe_file_write(&agent, &path, c.as_bytes(), Some(lbls))?;
                     println!("文件写入成功: {}", record.path);
                     println!("  Hash: {}", record.hash);
                     println!("  Size: {} bytes", record.size);
@@ -902,12 +1044,15 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        Commands::Push { message, r#ref, agent } => {
+        Commands::Push { message, r#ref, agent, auto_commit } => {
             let baize = open_baize()?;
             let result = baize.pipe_push(&agent, &message, r#ref.as_deref())?;
             println!("Push 成功: {} 个文件", result.files);
-            if result.pending {
-                println!("  状态: 等待用户审批 git commit");
+            if auto_commit {
+                let oid = baize.git_commit_all(&message, &agent)?;
+                println!("  Auto-commit: {}", &oid[..12.min(oid.len())]);
+            } else if result.pending {
+                println!("  状态: 等待 git commit（使用 --auto-commit 自动提交）");
             }
             Ok(())
         }
@@ -923,18 +1068,20 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Intent { action } => {
             match action {
-                IntentAction::Create { content, agent } => {
+                IntentAction::Create { content, content_file, agent } => {
+                    let c = resolve_content(content, content_file)?;
                     let baize = open_baize()?;
-                    let payload = baize_asl::AslAdapter::intent_from_blob(&content)?;
+                    let payload = baize_asl::AslAdapter::intent_from_blob(&c)?;
                     let labels = baize_asl::AslAdapter::intent_to_labels(&payload);
-                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    let blob = baize.pipe_blob_write(&agent, &c, &labels)?;
                     println!("意图创建成功: {}", blob.hash);
                 }
-                IntentAction::Derive { content, agent } => {
+                IntentAction::Derive { content, content_file, agent } => {
+                    let c = resolve_content(content, content_file)?;
                     let baize = open_baize()?;
-                    let payload = baize_asl::AslAdapter::sub_intent_from_blob(&content)?;
+                    let payload = baize_asl::AslAdapter::sub_intent_from_blob(&c)?;
                     let labels = baize_asl::AslAdapter::sub_intent_to_labels(&payload);
-                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    let blob = baize.pipe_blob_write(&agent, &c, &labels)?;
                     println!("子意图派生成功: {}", blob.hash);
                 }
                 IntentAction::Read { hash } => {
@@ -970,11 +1117,12 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Receipt { action } => {
             match action {
-                ReceiptAction::Create { content, agent } => {
+                ReceiptAction::Create { content, content_file, agent } => {
+                    let c = resolve_content(content, content_file)?;
                     let baize = open_baize()?;
-                    let payload = baize_asl::AslAdapter::receipt_from_blob(&content)?;
+                    let payload = baize_asl::AslAdapter::receipt_from_blob(&c)?;
                     let labels = baize_asl::AslAdapter::receipt_to_labels(&payload);
-                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    let blob = baize.pipe_blob_write(&agent, &c, &labels)?;
                     println!("回执创建成功: {}", blob.hash);
                 }
                 ReceiptAction::Read { hash } => {
@@ -1011,24 +1159,26 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Authz { action } => {
             match action {
-                AuthzAction::Issue { content, agent } => {
+                AuthzAction::Issue { content, content_file, agent } => {
+                    let c = resolve_content(content, content_file)?;
                     let baize = open_baize()?;
-                    let payload = baize_asl::AslAdapter::authorization_from_blob(&content)?;
+                    let payload = baize_asl::AslAdapter::authorization_from_blob(&c)?;
                     let labels = baize_asl::AslAdapter::authorization_to_labels(&payload);
-                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    let blob = baize.pipe_blob_write(&agent, &c, &labels)?;
                     println!("授权签发成功: {}", blob.hash);
                 }
-                AuthzAction::Delegate { content, agent } => {
+                AuthzAction::Delegate { content, content_file, agent } => {
+                    let c = resolve_content(content, content_file)?;
                     let baize = open_baize()?;
-                    let payload = baize_asl::AslAdapter::authorization_from_blob(&content)?;
+                    let payload = baize_asl::AslAdapter::authorization_from_blob(&c)?;
                     let labels = baize_asl::AslAdapter::authorization_to_labels(&payload);
-                    let blob = baize.pipe_blob_write(&agent, &content, &labels)?;
+                    let blob = baize.pipe_blob_write(&agent, &c, &labels)?;
                     println!("委托子授权成功: {}", blob.hash);
                 }
                 AuthzAction::Verify { hash, action_type } => {
                     let baize = open_baize()?;
                     let result = baize_asl::verify::verify_authorization(
-                        &baize.storage, &hash, &action_type,
+                        baize.store(), &hash, &action_type,
                         &baize_asl::verify::ExecutionContext::default(),
                     )?;
                     println!("授权校验结果:");
@@ -1207,7 +1357,7 @@ fn main() -> anyhow::Result<()> {
             match action {
                 CnvAction::Verify { receipt } => {
                     let baize = open_baize()?;
-                    let result = baize_asl::verify::cnv_verify(&baize.storage, &receipt)?;
+                    let result = baize_asl::verify::cnv_verify(baize.store(), &receipt)?;
                     println!("CNV 全链路校验:");
                     println!("  有效: {}", result.valid);
                     if !result.errors.is_empty() {
@@ -1216,6 +1366,121 @@ fn main() -> anyhow::Result<()> {
                             println!("    - {}", e);
                         }
                     }
+                }
+            }
+            Ok(())
+        }
+
+        Commands::Approval { action } => {
+            match action {
+                ApprovalCliAction::Pending { agent } => {
+                    let baize = open_baize()?;
+                    let requests = baize.approval_pending(&agent)?;
+                    if requests.is_empty() {
+                        println!("无待审批请求");
+                    } else {
+                        println!("待审批请求 ({}):", requests.len());
+                        for r in &requests {
+                            println!("  {} | {} → {} | {} | {}",
+                                &r.id[..8.min(r.id.len())],
+                                r.requester_id,
+                                r.action,
+                                r.status,
+                                r.created_at
+                            );
+                        }
+                    }
+                }
+                ApprovalCliAction::Show { id, agent } => {
+                    let baize = open_baize()?;
+                    let req = baize.approval_show(&id, &agent)?;
+                    println!("请求 ID: {}", req.id);
+                    println!("请求者: {} (L{})", req.requester_id, req.requester_level);
+                    println!("操作: {}", req.action);
+                    println!("状态: {}", req.status);
+                    if let Some(ref pending) = req.pending_at {
+                        println!("等待: {}", pending);
+                    }
+                    println!("授予: {} (剩余 {})", req.granted_count, req.remaining_count);
+                    println!("创建: {}", req.created_at);
+                    if !req.chain.is_empty() {
+                        println!("传导链:");
+                        for hop in &req.chain {
+                            println!("  {} [L{}] → {} ({})",
+                                hop.agent_id, hop.level, hop.decision, hop.decided_at
+                            );
+                        }
+                    }
+                }
+                ApprovalCliAction::Approve { id, count, note, agent } => {
+                    let baize = open_baize()?;
+                    let status = baize.approval_approve(&id, &agent, count, note.as_deref())?;
+                    println!("已审批: {} → {}", id, status);
+                }
+                ApprovalCliAction::Reject { id, reason, agent } => {
+                    let baize = open_baize()?;
+                    let status = baize.approval_reject(&id, &agent, reason.as_deref())?;
+                    println!("已驳回: {} → {}", id, status);
+                }
+                ApprovalCliAction::Escalate { id, reason, agent } => {
+                    let baize = open_baize()?;
+                    let status = baize.approval_escalate(&id, &agent, reason.as_deref())?;
+                    println!("已越权: {} → {}", id, status);
+                }
+                ApprovalCliAction::Preauth { grantee, action, count, agent } => {
+                    let baize = open_baize()?;
+                    let approval_action = action.parse::<baize_core::approval::ApprovalAction>()
+                        .map_err(|e| anyhow::anyhow!("无效操作类型: {}", e))?;
+                    let pa = baize.approval_preauth(&agent, &grantee, &approval_action, count)?;
+                    println!("预授权创建: {} ({} → {}, {} 次)", pa.id, pa.granter_id, pa.grantee_id, pa.remaining_count);
+                }
+                ApprovalCliAction::PreauthList { agent } => {
+                    let baize = open_baize()?;
+                    let list = baize.approval_list_preauth(&agent)?;
+                    if list.is_empty() {
+                        println!("无预授权");
+                    } else {
+                        println!("预授权 ({}):", list.len());
+                        for pa in &list {
+                            println!("  {} | {} → {} | {} | {}/{}",
+                                &pa.id[..8.min(pa.id.len())],
+                                pa.granter_id, pa.grantee_id,
+                                pa.action, pa.remaining_count, pa.granted_count
+                            );
+                        }
+                    }
+                }
+                ApprovalCliAction::PreauthDelete { id, agent } => {
+                    let baize = open_baize()?;
+                    baize.approval_delete_preauth(&id, &agent)?;
+                    println!("已删除预授权: {}", id);
+                }
+                ApprovalCliAction::Policy { agent: _ } => {
+                    let baize = open_baize()?;
+                    let rules = baize.approval_policy_get();
+                    if rules.is_empty() {
+                        println!("当前策略: 自动通过（无规则）");
+                    } else {
+                        println!("审批规则 ({}):", rules.len());
+                        for (i, rule) in rules.iter().enumerate() {
+                            println!("  [{}] {} L{}-L{}", i + 1, rule.action, rule.level_range.0, rule.level_range.1);
+                            for lc in &rule.levels {
+                                println!("    L{}: auto={}, max={}", lc.level, lc.auto, lc.max_grant_count);
+                            }
+                        }
+                    }
+                }
+                ApprovalCliAction::PolicySet { file, agent } => {
+                    if agent != ROOT_AGENT_ID {
+                        anyhow::bail!("只有 root 可以修改审批策略");
+                    }
+                    let baize = open_baize()?;
+                    let path = std::path::Path::new(&file);
+                    validate_path(path)?;
+                    let content = std::fs::read_to_string(path)?;
+                    let rules: Vec<baize_core::approval::ApprovalRule> = serde_json::from_str(&content)?;
+                    baize.approval_policy_update(rules)?;
+                    println!("策略已更新");
                 }
             }
             Ok(())

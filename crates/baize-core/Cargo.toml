@@ -3,6 +3,9 @@ name = "baize-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+internal-pipeline = []
+
 [dependencies]
 rusqlite = { workspace = true }
 rcgen = { workspace = true }
@@ -14,8 +17,10 @@ aes-gcm = { workspace = true }
 base64 = { workspace = true }
 getrandom = { workspace = true }
 x25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
 hkdf = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
 rand_core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

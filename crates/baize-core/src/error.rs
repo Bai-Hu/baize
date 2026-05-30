@@ -53,6 +53,15 @@ pub enum Error {
     #[error("proof required: {0}")]
     ProofRequired(String),
 
+    #[error("approval pending: {0}")]
+    ApprovalPending(String),
+
+    #[error("approval rejected: {0}")]
+    ApprovalRejected(String),
+
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
+
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -112,5 +121,8 @@ mod tests {
         assert!(format!("{}", Error::AuthorizationExpired("authz-1".into())).contains("authz-1"));
         assert!(format!("{}", Error::KeyRotation("no active key".into())).contains("no active key"));
         assert!(format!("{}", Error::ProofRequired("agent needs proof".into())).contains("agent needs proof"));
+        assert!(format!("{}", Error::ApprovalPending("apr-123".into())).contains("apr-123"));
+        assert!(format!("{}", Error::ApprovalRejected("out of scope".into())).contains("out of scope"));
+        assert!(format!("{}", Error::Unsupported("blob_delete not supported".into())).contains("blob_delete"));
     }
 }

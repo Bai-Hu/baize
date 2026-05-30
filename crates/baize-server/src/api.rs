@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::collections::HashMap;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 use axum::{
@@ -15,11 +17,13 @@ use serde::{Deserialize, Serialize};
 use crate::pipeline::{
     Baize,
     AgentRegistry, ElevationManager, DataOps, FileSync, GitOps,
+    ApprovalManager,
 };
 use crate::pipeline::agent_manager::PermissionGuard;
 use crate::pipeline::auditor::Auditor;
 use baize_core::labels::*;
 use baize_core::scope::{ElevationMode, Level};
+use baize_core::approval::ApprovalRule;
 
 // ─── 错误辅助 ───
 
@@ -59,6 +63,9 @@ fn map_error(e: baize_core::Error) -> axum::response::Response {
         baize_core::Error::AuthorizationExpired(_) => (StatusCode::GONE, "authorization expired"),
         baize_core::Error::KeyRotation(_) => (StatusCode::CONFLICT, "key rotation error"),
         baize_core::Error::ProofRequired(_) => (StatusCode::FORBIDDEN, "proof required"),
+        baize_core::Error::ApprovalPending(_) => (StatusCode::ACCEPTED, "approval pending"),
+        baize_core::Error::ApprovalRejected(_) => (StatusCode::FORBIDDEN, "approval rejected"),
+        baize_core::Error::Unsupported(_) => (StatusCode::METHOD_NOT_ALLOWED, "unsupported operation"),
     };
     error_response(status, msg)
 }
@@ -83,11 +90,17 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for AgentId {
 
 pub type AppState = Arc<Mutex<Baize>>;
 
+/// v2 nonce 重放防护缓存
+pub type NonceCache = Arc<tokio::sync::Mutex<HashMap<String, Instant>>>;
+
+const NONCE_WINDOW_SECS: u64 = 300; // 5 分钟
+const NONCE_CACHE_MAX: usize = 100_000; // 防止内存撑爆
+
 // ─── v1 签名验证 middleware ───
 
 /// v1 请求签名验证 middleware
 ///
-/// - 有 x-signature + x-timestamp 头时：验证 HMAC-SHA256 签名
+/// - 有 x-signature + x-timestamp 头时：验证签名（Ed25519 或 HMAC-SHA256）
 /// - 无签名头时：直接放行（fallback 到纯 x-agent-id，过渡期）
 async fn v1_signature_middleware(
     State(state): State<AppState>,
@@ -136,9 +149,11 @@ async fn v1_signature_middleware(
     let baize = state.lock().await;
     match get_agent_signing_key(&baize, &agent_id) {
         Ok(key) => {
-            // 验证签名
+            // v1: 允许 HMAC 兼容（旧客户端可能仍用 hmac-sha256: 前缀）
             if let Err(e) = crate::pipeline::auth::verify_signature(
+                baize.crypto.request_signer.as_ref(),
                 &key, &timestamp, &method, &path, &body_str, &signature,
+                true,
             ) {
                 return map_error(e);
             }
@@ -157,8 +172,8 @@ async fn v1_signature_middleware(
 
 /// 获取 agent 的签名密钥
 ///
-/// 查找 IDN_SIGN 用途的 agent-key blob，解密后提取 HMAC 密钥。
-/// 若无专用密钥，回退到 agent-id 索引的通用密钥（root agent 兼容）。
+/// 查找 IDN_SIGN 用途的 agent-key blob，解密后提取 Ed25519 私钥 seed。
+/// 若无法解析 Ed25519 PEM，回退到 HMAC-SHA256（兼容旧数据）。
 fn get_agent_signing_key(baize: &Baize, agent_id: &str) -> Result<Vec<u8>, String> {
     use crate::pipeline::agent_manager::KmsManager;
     let pem = baize.kms_get_active_key(agent_id, "IDN_SIGN")
@@ -171,9 +186,11 @@ fn get_agent_signing_key(baize: &Baize, agent_id: &str) -> Result<Vec<u8>, Strin
 /// v2 请求签名验证 middleware
 ///
 /// 与 v1 相同的签名验证逻辑，但**无签名时直接拒绝**（不 fallback）。
-/// 签名方案：HMAC-SHA256，密钥来源 INF-KMS IDN_SIGN 用途密钥。
+/// 签名方案：Ed25519（默认），密钥来源 INF-KMS IDN_SIGN 用途密钥。
+/// 可选 nonce 重放防护：x-nonce 头存在时检查缓存防重放。
 async fn v2_signature_middleware(
     State(state): State<AppState>,
+    axum::Extension(nonce_cache): axum::Extension<NonceCache>,
     req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
@@ -213,8 +230,11 @@ async fn v2_signature_middleware(
     let baize = state.lock().await;
     match get_agent_signing_key(&baize, &agent_id) {
         Ok(key) => {
+            // v2: 只接受 Ed25519 签名（不允许 HMAC 回退）
             if let Err(e) = crate::pipeline::auth::verify_signature(
+                baize.crypto.request_signer.as_ref(),
                 &key, &timestamp, &method, &path, &body_str, &signature,
+                false,
             ) {
                 return map_error(e);
             }
@@ -225,6 +245,22 @@ async fn v2_signature_middleware(
     }
     drop(baize);
 
+    // 可选 nonce 重放防护：x-nonce 存在时检查是否已使用
+    if let Some(nonce) = parts.headers.get("x-nonce").and_then(|v| v.to_str().ok()) {
+        let mut cache = nonce_cache.lock().await;
+        let now = Instant::now();
+        // 淘汰过期条目
+        cache.retain(|_, t| now.duration_since(*t).as_secs() < NONCE_WINDOW_SECS);
+        if cache.contains_key(nonce) {
+            return error_response(StatusCode::CONFLICT, "nonce already used");
+        }
+        // 超过上限时拒绝新 nonce（防止内存攻击）
+        if cache.len() >= NONCE_CACHE_MAX {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "nonce cache full, retry later");
+        }
+        cache.insert(nonce.to_string(), now);
+    }
+
     // 重建请求
     let new_req = Request::from_parts(parts, Body::from(body_bytes));
     next.run(new_req).await
@@ -232,6 +268,7 @@ async fn v2_signature_middleware(
 
 pub fn app(baize: Baize) -> Router {
     let state = Arc::new(Mutex::new(baize));
+    let nonce_cache: NonceCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     Router::new()
         // ─── v0 路由（保持不变）───
         .route("/api/v0/agents", post(register_agent))
@@ -329,13 +366,29 @@ pub fn app(baize: Baize) -> Router {
         .route("/api/v2/receipts", post(v1_receipt_create))
         .route("/api/v2/sessions", post(v1_session_create))
         .route("/api/v2/sessions/{id}/accept", post(v1_session_accept))
+        .route("/api/v2/sessions/{id}", get(v1_session_read))
         .route("/api/v2/sessions/{id}/close", post(v1_session_close))
+        .route("/api/v2/sessions/{id}/message", post(v2_session_message))
         .route("/api/v2/agents/{id}/keys/rotate", post(v1_key_rotate))
         .route("/api/v2/agents/{id}/proof", post(v1_agent_proof))
         .route("/api/v2/agents/{id}/proof/verify", get(v2_proof_verify))
+        .route("/api/v2/cnv/verify", post(v1_cnv_verify))
 
-        // v2 签名强制 middleware
+        // v2 审批管理
+        .route("/api/v2/approval/pending", get(approval_pending_list))
+        .route("/api/v2/approval/requests/{id}", get(approval_request_show))
+        .route("/api/v2/approval/requests/{id}/approve", post(approval_request_approve))
+        .route("/api/v2/approval/requests/{id}/reject", post(approval_request_reject))
+        .route("/api/v2/approval/requests/{id}/escalate", post(approval_request_escalate))
+        .route("/api/v2/approval/preauth", get(approval_preauth_list))
+        .route("/api/v2/approval/preauth", post(approval_preauth_create))
+        .route("/api/v2/approval/preauth/{id}", delete(approval_preauth_delete))
+        .route("/api/v2/approval/policy", get(approval_policy_get))
+        .route("/api/v2/approval/policy", put(approval_policy_update))
+
+        // v2 签名强制 middleware + nonce 重放防护
         .layer(middleware::from_fn_with_state(state.clone(), v2_signature_middleware))
+        .layer(axum::Extension(nonce_cache))
         .with_state(state)
 }
 
@@ -514,6 +567,15 @@ struct V1SessionCloseRequest {
 }
 
 #[derive(Deserialize)]
+struct V2SessionMessageRequest {
+    /// 加密消息内容（服务端不解密）
+    ciphertext: String,
+    /// 消息序列号（必须单调递增）
+    #[serde(rename = "seq")]
+    message_seq: u64,
+}
+
+#[derive(Deserialize)]
 struct V1CnvVerifyRequest {
     receipt_digest: String,
 }
@@ -537,15 +599,49 @@ fn default_proof_anchor() -> String {
     "CREDENTIAL_ANCHORED".to_string()
 }
 
+// ─── 审批 DTO ───
+
+#[derive(Deserialize)]
+struct ApprovalApproveRequest {
+    granted_count: u32,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ApprovalRejectRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ApprovalEscalateRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PreauthCreateRequest {
+    grantee_id: String,
+    action: String,
+    count: u32,
+}
+
+#[derive(Deserialize)]
+struct ApprovalPolicyUpdateRequest {
+    rules: Vec<ApprovalRule>,
+}
+
 // ─── v0 Handler ───
 
 async fn register_agent(
     State(state): State<AppState>,
-    _agent: AgentId,
+    agent: AgentId,
     Json(req): Json<RegisterAgentRequest>,
 ) -> impl IntoResponse {
     let mut baize = state.lock().await;
     match baize.agent_register(
+        &agent.0,
         &req.name,
         Level(req.level),
         req.zones.iter().map(|s| s.as_str()).collect(),
@@ -577,11 +673,11 @@ async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn revoke_agent(
     State(state): State<AppState>,
-    _agent: AgentId,
+    agent: AgentId,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let mut baize = state.lock().await;
-    match baize.agent_revoke(&id) {
+    match baize.agent_revoke(&agent.0, &id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => map_error(e),
     }
@@ -1225,7 +1321,7 @@ async fn v1_authorization_verify(
         amount: req.amount,
         environment: req.environment,
     };
-    match baize_asl::verify::verify_authorization(&baize.storage, &hash, &req.action_type, &exec_ctx) {
+    match baize_asl::verify::verify_authorization(baize.store(), &hash, &req.action_type, &exec_ctx) {
         Ok(result) => {
             let checks_map: std::collections::BTreeMap<&str, bool> = [
                 ("credential_authenticity", result.checks[0]),
@@ -1464,13 +1560,47 @@ async fn v1_session_close(
     }
 }
 
+// LNK-DTX：session 内加密消息（v2 专用，签名强制）
+async fn v2_session_message(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Path(id): Path<String>,
+    Json(req): Json<V2SessionMessageRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+
+    // 构造 message content（服务端不解密，只记录密文）
+    let content = serde_json::json!({
+        "session_id": id,
+        "action": "message",
+        "from": agent.0,
+        "ciphertext": req.ciphertext,
+        "seq": req.message_seq,
+    }).to_string();
+
+    let labels = std::collections::HashMap::from([
+        ("type".to_string(), baize_core::labels::BLOB_TYPE_SESSION_MESSAGE.to_string()),
+        (baize_core::labels::LABEL_SESSION_ID.to_string(), id.clone()),
+        (baize_core::labels::LABEL_MESSAGE_SEQ.to_string(), req.message_seq.to_string()),
+    ]);
+
+    match baize.pipe_blob_write(&agent.0, &content, &labels) {
+        Ok(blob) => (StatusCode::CREATED, Json(serde_json::json!({
+            "hash": blob.hash,
+            "session_id": id,
+            "seq": req.message_seq,
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
 // INT：CNV 全链路校验
 async fn v1_cnv_verify(
     State(state): State<AppState>,
     Json(req): Json<V1CnvVerifyRequest>,
 ) -> impl IntoResponse {
     let baize = state.lock().await;
-    match baize_asl::verify::cnv_verify(&baize.storage, &req.receipt_digest) {
+    match baize_asl::verify::cnv_verify(baize.store(), &req.receipt_digest) {
         Ok(result) => {
             let intent_chain: Vec<serde_json::Value> = result.intent_chain.iter().map(|node| {
                 serde_json::json!({
@@ -1700,6 +1830,197 @@ async fn v2_proof_verify(
             "proof_id": proof.proof_id,
             "expires_at": proof.expires_at,
         }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// ─── 审批管理 Handler ───
+
+// 列出待当前 agent 审批的请求
+async fn approval_pending_list(
+    State(state): State<AppState>,
+    agent: AgentId,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.approval_pending(&agent.0) {
+        Ok(requests) => Json(serde_json::json!({
+            "requests": requests.iter().map(|r| serde_json::json!({
+                "id": r.id,
+                "requester_id": r.requester_id,
+                "requester_level": r.requester_level,
+                "action": r.action.to_string(),
+                "status": r.status.to_string(),
+                "created_at": r.created_at,
+            })).collect::<Vec<_>>()
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// 查看审批请求详情（含完整传导链）
+async fn approval_request_show(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.approval_show(&id, &agent.0) {
+        Ok(req) => Json(serde_json::json!({
+            "id": req.id,
+            "requester_id": req.requester_id,
+            "requester_level": req.requester_level,
+            "action": req.action.to_string(),
+            "status": req.status.to_string(),
+            "pending_at": req.pending_at,
+            "granted_count": req.granted_count,
+            "remaining_count": req.remaining_count,
+            "created_at": req.created_at,
+            "expires_at": req.expires_at,
+            "chain": req.chain.iter().map(|hop| serde_json::json!({
+                "agent_id": hop.agent_id,
+                "level": hop.level,
+                "decision": hop.decision.to_string(),
+                "note": hop.note,
+                "decided_at": hop.decided_at,
+            })).collect::<Vec<_>>(),
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// 审批通过
+async fn approval_request_approve(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Path(id): Path<String>,
+    Json(req): Json<ApprovalApproveRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.approval_approve(&id, &agent.0, req.granted_count, req.note.as_deref()) {
+        Ok(status) => Json(serde_json::json!({
+            "request_id": id,
+            "status": status.to_string(),
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// 驳回请求
+async fn approval_request_reject(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Path(id): Path<String>,
+    Json(req): Json<ApprovalRejectRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.approval_reject(&id, &agent.0, req.reason.as_deref()) {
+        Ok(status) => Json(serde_json::json!({
+            "request_id": id,
+            "status": status.to_string(),
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// 越权上传
+async fn approval_request_escalate(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Path(id): Path<String>,
+    Json(req): Json<ApprovalEscalateRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.approval_escalate(&id, &agent.0, req.reason.as_deref()) {
+        Ok(status) => Json(serde_json::json!({
+            "request_id": id,
+            "status": status.to_string(),
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// 列出预授权
+async fn approval_preauth_list(
+    State(state): State<AppState>,
+    agent: AgentId,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.approval_list_preauth(&agent.0) {
+        Ok(preauths) => Json(serde_json::json!({
+            "preauths": preauths.iter().map(|pa| serde_json::json!({
+                "id": pa.id,
+                "granter_id": pa.granter_id,
+                "grantee_id": pa.grantee_id,
+                "action": pa.action.to_string(),
+                "granted_count": pa.granted_count,
+                "remaining_count": pa.remaining_count,
+                "created_at": pa.created_at,
+            })).collect::<Vec<_>>()
+        })).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// 创建预授权
+async fn approval_preauth_create(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Json(req): Json<PreauthCreateRequest>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let action = match req.action.parse::<baize_core::approval::ApprovalAction>() {
+        Ok(a) => a,
+        Err(msg) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("invalid action: {}", msg)
+        }))).into_response(),
+    };
+    match baize.approval_preauth(&agent.0, &req.grantee_id, &action, req.count) {
+        Ok(pa) => (StatusCode::CREATED, Json(serde_json::json!({
+            "id": pa.id,
+            "granter_id": pa.granter_id,
+            "grantee_id": pa.grantee_id,
+            "action": pa.action.to_string(),
+            "granted_count": pa.granted_count,
+            "remaining_count": pa.remaining_count,
+        }))).into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// 删除预授权（仅 root 或授权者可操作）
+async fn approval_preauth_delete(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    match baize.approval_delete_preauth(&id, &agent.0) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => map_error(e),
+    }
+}
+
+// 查看审批策略
+async fn approval_policy_get(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let baize = state.lock().await;
+    let rules = baize.approval_policy_get();
+    Json(serde_json::json!({ "rules": rules })).into_response()
+}
+
+// 更新审批策略（仅 root 可操作）
+async fn approval_policy_update(
+    State(state): State<AppState>,
+    agent: AgentId,
+    Json(req): Json<ApprovalPolicyUpdateRequest>,
+) -> impl IntoResponse {
+    if agent.0 != baize_core::ROOT_AGENT_ID {
+        return error_response(StatusCode::FORBIDDEN, "only root can update approval policy");
+    }
+    let baize = state.lock().await;
+    match baize.approval_policy_update(req.rules) {
+        Ok(()) => Json(serde_json::json!({ "status": "updated" })).into_response(),
         Err(e) => map_error(e),
     }
 }

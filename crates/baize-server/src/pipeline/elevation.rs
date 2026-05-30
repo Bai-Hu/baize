@@ -48,11 +48,11 @@ impl Baize {
         }
 
         // approver 必须存在
-        let (approver_identity, _) = self.agents.get(approver)
+        let approver_identity = self.identity.get_identity(approver)
             .ok_or_else(|| Error::NotFound(format!("approver agent {}", approver)))?;
 
         // approver 必须是 requester 的 parent
-        let (requester_identity, _) = self.agents.get(request_agent_id)
+        let requester_identity = self.identity.get_identity(request_agent_id)
             .ok_or_else(|| Error::NotFound(format!("requester agent {}", request_agent_id)))?;
 
         let is_parent = requester_identity.parent_id.as_deref() == Some(approver);
@@ -66,7 +66,7 @@ impl Baize {
         // 检查请求的 zones 是否在 approver scope 内
         let approver_scope = Scope::new(
             Level(approver_identity.level),
-            approver_identity.zones.iter().map(|s| s.as_str()),
+            approver_identity.zones.iter().map(|s: &String| s.as_str()),
         )?;
 
         let all_in_scope = request_zones.iter().all(|z| {
@@ -126,7 +126,7 @@ impl ElevationManager for Baize {
         let _ = self.elevation_cleanup_expired();
 
         // 验证 agent 存在
-        let _ = self.agents.get(agent_id)
+        let _ = self.identity.get_identity(agent_id)
             .ok_or_else(|| Error::NotFound(format!("agent {}", agent_id)))?;
 
         let zones_vec: Vec<String> = zones.iter().map(|s| s.to_string()).collect();
@@ -255,11 +255,11 @@ impl ElevationManager for Baize {
         }
 
         // 获取 agent 当前 scope → 清理 workspace
-        let (identity, _) = self.agents.get(agent_id)
+        let identity = self.identity.get_identity(agent_id)
             .ok_or_else(|| Error::NotFound(format!("agent {}", agent_id)))?;
         let agent_scope = Scope::new(
             Level(identity.level),
-            identity.zones.iter().map(|s| s.as_str()),
+            identity.zones.iter().map(|s: &String| s.as_str()),
         )?;
 
         let cleaned = self.workspace_mgr.clean(agent_id, &agent_scope)?;

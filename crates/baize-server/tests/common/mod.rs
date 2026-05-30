@@ -13,6 +13,7 @@ use baize_server::api;
 use baize_server::pipeline::auth;
 use baize_server::pipeline::agent_manager::KmsManager;
 use baize_server::Baize;
+use baize_core::crypto::CryptoProvider;
 use http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -29,7 +30,7 @@ pub fn test_app_with_key(agent_id: &str, level: u8, zones: &[&str]) -> (Router, 
     let mut baize = Baize::init_in_memory().unwrap();
     use baize_server::pipeline::AgentRegistry;
     use baize_core::scope::Level;
-    baize.agent_register(agent_id, Level(level), zones.to_vec(), None).unwrap();
+    baize.agent_register("baize-root", agent_id, Level(level), zones.to_vec(), None).unwrap();
     let key = {
         let pem = baize.kms_get_active_key(agent_id, "IDN_SIGN").unwrap();
         auth::extract_signing_key(&pem)
@@ -97,7 +98,8 @@ pub fn signed_request(
 ) -> Request<Body> {
     let body_str = serde_json::to_string(&body).unwrap();
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let sig = auth::compute_signature(key, &timestamp, method, uri, &body_str);
+    let signer = CryptoProvider::default();
+    let sig = auth::compute_signature(signer.request_signer.as_ref(), key, &timestamp, method, uri, &body_str);
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
@@ -113,7 +115,8 @@ pub fn signed_request(
 
 pub fn signed_get_req(uri: &str, agent_id: &str, key: &[u8]) -> Request<Body> {
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let sig = auth::compute_signature(key, &timestamp, "GET", uri, "");
+    let signer = CryptoProvider::default();
+    let sig = auth::compute_signature(signer.request_signer.as_ref(), key, &timestamp, "GET", uri, "");
     Request::builder()
         .method("GET")
         .uri(uri)

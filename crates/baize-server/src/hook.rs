@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use baize_core::cert::CertIdentity;
+use baize_core::identity::AgentIdentity;
 use baize_core::scope::Scope;
 
 /// Hook 上下文：包含操作的所有信息
 #[derive(Debug, Clone)]
 pub struct HookContext {
     pub agent_id: String,
-    pub identity: Option<CertIdentity>,
+    pub identity: Option<AgentIdentity>,
     pub operation: String,
     pub scope: Option<Scope>,
     pub params: HashMap<String, String>,
@@ -120,17 +120,19 @@ pub fn default_hooks() -> HookRegistry {
 mod tests {
     use super::*;
     use baize_core::scope::{Level, Scope};
+    use baize_core::cert::CredentialStatus;
 
     fn basic_ctx() -> HookContext {
         let scope = Scope::new(Level(2), vec!["A"]).unwrap();
         HookContext {
             agent_id: "agent-001".to_string(),
-            identity: Some(baize_core::cert::CertIdentity {
+            identity: Some(AgentIdentity {
                 agent_id: "agent-001".to_string(),
                 parent_id: None,
                 level: 2,
                 zones: vec!["A".to_string()],
-                status: baize_core::cert::CredentialStatus::Active,
+                status: CredentialStatus::Active,
+                attributes: HashMap::new(),
             }),
             operation: "test".to_string(),
             scope: Some(scope),

@@ -91,10 +91,32 @@ pub const LABEL_PROOF_CREDENTIAL: &str = "x-proof-credential";
 pub const LABEL_AUDIT_PREV: &str = "x-audit-prev";
 pub const LABEL_AUDIT_CHAIN_INDEX: &str = "x-audit-chain-index";
 
+// ─── Approval engine labels ───
+
+pub const LABEL_APPROVAL_ID: &str = "x-approval-id";
+pub const LABEL_APPROVAL_ACTION: &str = "x-approval-action";
+pub const LABEL_APPROVAL_REQUESTER: &str = "x-approval-requester";
+pub const LABEL_APPROVAL_STATUS: &str = "x-approval-status";
+pub const LABEL_APPROVAL_PENDING_AT: &str = "x-approval-pending-at";
+pub const LABEL_APPROVAL_GRANTED: &str = "x-approval-granted";
+pub const LABEL_APPROVAL_REMAINING: &str = "x-approval-remaining";
+pub const LABEL_APPROVAL_REQUESTER_LEVEL: &str = "x-approval-requester-level";
+
+// ─── Pre-authorization labels ───
+
+pub const LABEL_PREAUTH_ID: &str = "x-preauth-id";
+pub const LABEL_PREAUTH_GRANTER: &str = "x-preauth-granter";
+pub const LABEL_PREAUTH_GRANTEE: &str = "x-preauth-grantee";
+pub const LABEL_PREAUTH_ACTION: &str = "x-preauth-action";
+pub const LABEL_PREAUTH_REMAINING: &str = "x-preauth-remaining";
+
 // ─── INF-KMS 密钥用途 ───
 
 /// INF-KMS 密钥用途常量
 pub const KEY_PURPOSES: &[&str] = &["IDN_SIGN", "INT_SIGN", "AZN_SIGN", "RCT_SIGN", "SESSION"];
+
+/// Root CA 证书签名密钥用途（P-256，用于签发子证书，不属于 ASL 用途密钥）
+pub const KEY_PURPOSE_CERT_SIGN: &str = "cert-sign";
 
 // ─── Blob type 常量 ───
 
@@ -104,6 +126,7 @@ pub const BLOB_TYPE_RECEIPT: &str = "receipt";
 pub const BLOB_TYPE_AUTHORIZATION: &str = "authorization";
 pub const BLOB_TYPE_SESSION_INIT: &str = "session-init";
 pub const BLOB_TYPE_SESSION_ACCEPT: &str = "session-accept";
+pub const BLOB_TYPE_SESSION_MESSAGE: &str = "session-message";
 pub const BLOB_TYPE_AGENT_CERT: &str = "agent-cert";
 pub const BLOB_TYPE_AGENT_KEY: &str = "agent-key";
 pub const BLOB_TYPE_ROOT_CA: &str = "root-ca";
@@ -129,6 +152,11 @@ mod tests {
         LABEL_SESSION_CLOSED_AT, LABEL_SESSION_CLOSE_REASON, LABEL_SESSION_FINAL_HASH,
         LABEL_MESSAGE_ID, LABEL_MESSAGE_SEQ, LABEL_PROOF_AGENT, LABEL_PROOF_CREDENTIAL,
         LABEL_AUDIT_PREV, LABEL_AUDIT_CHAIN_INDEX,
+        LABEL_APPROVAL_ID, LABEL_APPROVAL_ACTION, LABEL_APPROVAL_REQUESTER,
+        LABEL_APPROVAL_STATUS, LABEL_APPROVAL_PENDING_AT, LABEL_APPROVAL_GRANTED,
+        LABEL_APPROVAL_REMAINING, LABEL_APPROVAL_REQUESTER_LEVEL,
+        LABEL_PREAUTH_ID, LABEL_PREAUTH_GRANTER, LABEL_PREAUTH_GRANTEE,
+        LABEL_PREAUTH_ACTION, LABEL_PREAUTH_REMAINING,
     ];
 
     #[test]

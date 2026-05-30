@@ -31,6 +31,8 @@ pub trait GitOps {
     fn git_ref_delete(&self, name: &str) -> Result<(), Error>;
     /// 仓库统计信息
     fn repo_stats(&self) -> Result<RepoStats, Error>;
+    /// Git add all + commit，返回 commit OID
+    fn git_commit_all(&self, message: &str, author: &str) -> Result<String, Error>;
 }
 
 impl Baize {
@@ -161,5 +163,76 @@ impl GitOps for Baize {
             total_commits,
             total_refs,
         })
+    }
+
+    /// Git add all + commit：将主仓库工作区的所有变更提交到 Git 历史
+    ///
+    /// 等价于 `git add -A && git commit -m <message>`
+    /// 用于 `bz push --auto-commit` 自动完成 git commit
+    fn git_commit_all(&self, message: &str, author: &str) -> Result<String, Error> {
+        let repo = self.git_repo()?;
+
+        // 将工作区文件全部加入 index
+        let mut index = repo.index()
+            .map_err(|e| Error::Internal(anyhow::anyhow!("git index: {}", e)))?;
+
+        // 递归添加所有文件（跳过 .git）
+        let workdir = repo.workdir()
+            .ok_or_else(|| Error::Internal(anyhow::anyhow!("git repo has no working directory")))?;
+        let mut stack = vec![workdir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .map_err(|e| Error::Internal(anyhow::anyhow!("read dir {:?}: {}", dir, e)))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| Error::Internal(anyhow::anyhow!("dir entry: {}", e)))?;
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name() == Some(std::ffi::OsStr::new(".git")) {
+                        continue;
+                    }
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(workdir)
+                        .map_err(|e| Error::Internal(anyhow::anyhow!("path prefix: {}", e)))?;
+                    index.add_path(rel)
+                        .map_err(|e| Error::Internal(anyhow::anyhow!("git add {:?}: {}", rel, e)))?;
+                }
+            }
+        }
+        index.write()
+            .map_err(|e| Error::Internal(anyhow::anyhow!("git index write: {}", e)))?;
+
+        let tree_oid = index.write_tree()
+            .map_err(|e| Error::Internal(anyhow::anyhow!("git write tree: {}", e)))?;
+        let tree = repo.find_tree(tree_oid)
+            .map_err(|e| Error::Internal(anyhow::anyhow!("git find tree: {}", e)))?;
+
+        let sig = git2::Signature::now(author, "baize@local")
+            .map_err(|e| Error::Internal(anyhow::anyhow!("git signature: {}", e)))?;
+
+        // 获取父 commit（HEAD），首次 commit 无父节点
+        let parents: Vec<git2::Commit> = match repo.head() {
+            Ok(head) => {
+                if let Some(oid) = head.target() {
+                    vec![repo.find_commit(oid)
+                        .map_err(|e| Error::Internal(anyhow::anyhow!("git find commit: {}", e)))?]
+                } else {
+                    vec![]
+                }
+            }
+            Err(_) => vec![],
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+
+        let oid = repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            message,
+            &tree,
+            &parent_refs,
+        ).map_err(|e| Error::Internal(anyhow::anyhow!("git commit: {}", e)))?;
+
+        Ok(format!("{}", oid))
     }
 }
